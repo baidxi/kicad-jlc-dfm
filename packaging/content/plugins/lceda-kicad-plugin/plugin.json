@@ -1,0 +1,27 @@
+{
+    "identifier": "tools.juno.lceda-kicad-plugin",
+    "name": "LCSC → KiCad",
+    "description": "立创元件库助手:搜索立创元件放置到原理图,批量修改封装并自动下载封装与 3D 模型到全局库",
+    "runtime": {
+        "type": "python",
+        "min_version": "3.10"
+    },
+    "actions": [
+        {
+            "identifier": "lceda-plugin",
+            "name": "LCSC 元件库助手",
+            "description": "搜索立创元件、交互式放置到原理图、批量修改封装与 3D 关联",
+            "scopes": [
+                "schematic"
+            ],
+            "show-button": true,
+            "entrypoint": "lceda_plugin_entry.py",
+            "icons-light": [
+                "icon.png"
+            ],
+            "icons-dark": [
+                "icon.png"
+            ]
+        }
+    ]
+}

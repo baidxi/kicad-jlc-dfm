@@ -1,0 +1,91 @@
+name: Release PCM package
+
+# 两种触发方式:
+#   1. 手动:Actions 页 → Release PCM package → Run workflow(可填版本号,默认 0.1.0)
+#      → 构建并上传 artifact(供本地测试,不创建 Release)
+#   2. 自动:推送 v* 标签(如 v1.0.0)
+#      → 构建并创建 GitHub Release,上传:
+#        - lceda-kicad-plugin-<版本>-pcm.zip       ← 插件管理器「从文件安装」用
+#        - …-pcm.repository-entry.json             ← 提交官方 kicad/addons 仓库用
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "包版本号(如 1.0.0,留空用 0.1.0)"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install kipy (fork with interactive place support)
+        run: |
+          python3 -m pip install --upgrade pip
+          pip install "kicad-python @ git+https://github.com/baidxi/kicad-python.git"
+
+      - name: Resolve version
+        id: ver
+        run: |
+          if [ -n "${{ github.event.inputs.version }}" ]; then
+            echo "version=${{ github.event.inputs.version }}" >> "$GITHUB_OUTPUT"
+            echo "is_tag=false" >> "$GITHUB_OUTPUT"
+          elif [[ "$GITHUB_REF_NAME" == v* ]]; then
+            echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+            echo "is_tag=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=0.1.0" >> "$GITHUB_OUTPUT"
+            echo "is_tag=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build PCM package
+        run: |
+          echo "Package version: ${{ steps.ver.outputs.version }}"
+          python3 packaging/build_pcm.py --version "${{ steps.ver.outputs.version }}"
+
+      - name: Check package contents
+        run: |
+          python3 - <<'EOF'
+          import glob, zipfile
+          zips = glob.glob("dist/*-pcm.zip")
+          assert len(zips) == 1, f"expected exactly one zip, got {zips}"
+          names = zipfile.ZipFile(zips[0]).namelist()
+          assert "metadata.json" in names, "missing metadata.json"
+          assert "plugins/lceda-kicad-plugin/plugin.json" in names, "missing plugin manifest"
+          assert any(n.endswith("lceda_plugin/main.py") for n in names), "missing app code"
+          assert any(n.endswith("kipy/__init__.py") for n in names), "missing bundled kipy"
+          print("package contents OK")
+          EOF
+
+      - name: Upload build artifact (manual runs)
+        if: steps.ver.outputs.is_tag != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: lceda-kicad-plugin-${{ steps.ver.outputs.version }}-pcm
+          path: |
+            dist/*-pcm.zip
+            dist/*-pcm.repository-entry.json
+
+      - name: Create GitHub Release (tag pushes)
+        if: steps.ver.outputs.is_tag == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            dist/*-pcm.zip
+            dist/*-pcm.repository-entry.json
