@@ -187,6 +187,24 @@ def emit_repository_entry(out: Path) -> None:
     out.with_suffix(".repository-entry.json").write_text(
         json.dumps(entry, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"仓库条目: {out.with_suffix('.repository-entry.json')}")
+    return entry
+
+
+def emit_repository_index(out: Path, entry: dict) -> None:
+    """输出完整个人仓库索引 repository.json。
+
+    把它与 zip 一起放到任意 HTTP 服务(如 GitHub Pages),即可在
+    KiCad 插件管理器 → 管理仓库 中添加该 URL,实现在线安装与更新。
+    注意:download_url 需改为 zip 的实际 HTTP 地址。
+    """
+    index = {
+        "$schema": "https://go.kicad.org/pcm/v2/schema/repository",
+        "name": "LCSC KiCad Integration (personal repository)",
+        "packages": [entry],
+    }
+    idx = out.with_name("repository.json")
+    idx.write_text(json.dumps(index, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"个人仓库索引: {idx}  (download_url 需改为 zip 的实际 HTTP 地址)")
 
 
 def main() -> int:
@@ -195,7 +213,10 @@ def main() -> int:
     ap.add_argument("--version", help="Override package version (e.g. 1.2.0 from git tag)")
     args = ap.parse_args()
     out = build(args.version)
-    emit_repository_entry(out)
+    entry = emit_repository_entry(out)
+    # 自建仓库索引中的 zip 地址:发布到 HTTP 服务后改为实际 URL
+    entry["versions"][0]["download_url"] = out.name
+    emit_repository_index(out, entry)
     if args.no_validate:
         return 0
     return 0 if validate(out) else 1

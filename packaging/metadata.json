@@ -16,7 +16,7 @@
     "jlcpcb",
     "schematic",
     "footprint",
-    "3d"
+    "models"
   ],
   "keep_on_update": [
     "plugins/lceda-kicad-plugin/lceda_plugin_settings.json"
@@ -26,11 +26,7 @@
       "version": "1.0.0",
       "status": "testing",
       "kicad_version": "10.99",
-      "runtime": {
-        "python": {
-          "min_version": "3.10"
-        }
-      }
+      "runtime": "ipc"
     }
   ]
 }

@@ -139,6 +139,14 @@ class KicadBridge:
                     "(或重启 KiCad)后重试;此步骤仅需一次。") from ex
             raise
         from kipy.geometry import Vector2  # noqa: PLC0415
+
+        # 能力检测:旧版 kipy 无 interactive 参数 → 自动降级为程序化直落
+        import inspect  # noqa: PLC0415
+        supports = "interactive" in inspect.signature(
+            sch.place_symbol_from_library).parameters
+        if interactive and not supports:
+            interactive = False
+
         instance = self._retry(lambda: sch.place_symbol_from_library(
             lib_id, Vector2.from_xy_mm(position_mm[0], position_mm[1]),
             interactive=interactive))
