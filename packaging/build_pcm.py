@@ -28,8 +28,35 @@ from pathlib import Path
 PKG_ROOT = Path(__file__).resolve().parent
 APP_ROOT = PKG_ROOT.parent
 PLUGIN_SRC = PKG_ROOT / "content" / "plugins" / "lceda-kicad-plugin"
-KIPY_SRC = APP_ROOT / "kicad-python" / "kipy"
 DIST = APP_ROOT / "dist"
+
+
+def _has_interactive(kipy_dir: Path) -> bool:
+    pb = kipy_dir / "proto" / "schematic" / "schematic_commands_pb2.py"
+    try:
+        return "interactive" in pb.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return False
+
+
+def _kipy_src() -> Path:
+    """kipy 源目录:优先用户 fork 的优化版(含 interactive 扩展)。
+
+    顺序:
+      1. 已安装的 kipy —— CI 从用户 fork 安装,含交互放置优化
+      2. 仓库内 kicad-python/kipy —— 本地开发副本(同样含扩展)
+      3. 兜底:任意已安装 kipy
+    """
+    import kipy  # noqa: PLC0415
+
+    installed = Path(kipy.__file__).parent
+    repo_copy = APP_ROOT / "kicad-python" / "kipy"
+
+    if _has_interactive(installed):
+        return installed
+    if repo_copy.is_dir() and _has_interactive(repo_copy):
+        return repo_copy
+    return installed
 
 
 def _app_source_dir() -> Path:
@@ -88,7 +115,7 @@ def build(version: str | None = None) -> Path:
     # 主代码 + kipy 随包分发
     # 目标目录名固定 lceda_plugin(合法包名);源码来自用户目录 lceda-plugin
     n1 = _copy_tree(_app_source_dir(), plugin_dir / "lceda_plugin")
-    n2 = _copy_tree(KIPY_SRC, plugin_dir / "kipy") if KIPY_SRC.is_dir() else 0
+    n2 = _copy_tree(_kipy_src(), plugin_dir / "kipy")
     print(f"主代码 {n1} 个文件, kipy {n2} 个文件")
 
     # PCM 元数据(archive 内不得含 download_* 键)

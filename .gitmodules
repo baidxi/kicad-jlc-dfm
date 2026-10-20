@@ -1,0 +1,3 @@
+[submodule "kicad-python"]
+	path = kicad-python
+	url = https://github.com/baidxi/kicad-python.git
