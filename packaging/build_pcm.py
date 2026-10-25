@@ -7,6 +7,7 @@
         plugin.json  icon.png  lceda_plugin_entry.py  README.md
         lceda_plugin/                      # 主代码(打包时从工作区拷贝)
         kipy/                              # IPC 绑定(随包分发,免装 kicad-python)
+        pip.pyz                            # pip zipapp(无 pip 环境的依赖引导)
 
 用法:
     python3 packaging/build_pcm.py             # 打包 + kipy validate
@@ -36,6 +37,29 @@ def _has_interactive(kipy_dir: Path) -> bool:
     try:
         return "interactive" in pb.read_text(encoding="utf-8", errors="ignore")
     except OSError:
+        return False
+
+
+PIP_PYZ_URL = "https://bootstrap.pypa.io/pip/pip.pyz"
+
+
+def _fetch_pip_pyz(plugin_dir: Path) -> bool:
+    """下载官方 pip zipapp 随包分发(约 2 MB)。
+
+    全新 Ubuntu 24.04 等系统无 python3-pip 且 ensurepip 被剥离,
+    KiCad 内置精简 Python 亦然;插件入口首次运行的依赖引导
+    (pip.pyz install --user)以此兜底。
+    """
+    dest = plugin_dir / "pip.pyz"
+    try:
+        import urllib.request
+
+        urllib.request.urlretrieve(PIP_PYZ_URL, dest)
+        print(f"pip.pyz {dest.stat().st_size // 1024} KB(随包分发)")
+        return True
+    except Exception as exc:  # noqa: BLE001
+        print(f"[warn] pip.pyz 下载失败({exc});"
+              "无 pip 的目标机将无法自动安装依赖")
         return False
 
 
@@ -105,6 +129,10 @@ def build(version: str | None = None) -> Path:
     plugin_dir.mkdir(parents=True, exist_ok=True)
 
     # 静态文件
+    # 注意:不放 requirements.txt —— KiCad 10.99 的 INSTALL_REQUIREMENTS
+    # 会在启动时用 venv 的 pip 安装它,而 Ubuntu 24.04 等缺 python3-venv 的
+    # 系统上 venv 是残缺的(无 pip),安装失败会导致插件永不 ready、
+    # 工具栏按钮不出现(死锁)。依赖改由入口脚本 pip.pyz 兜底安装。
     for f in ("plugin.json", "icon.png", "lceda_plugin_entry.py", "README.md"):
         src = PLUGIN_SRC / f
         if src.exists():
@@ -116,6 +144,7 @@ def build(version: str | None = None) -> Path:
     # 目标目录名固定 lceda_plugin(合法包名);源码来自用户目录 lceda-plugin
     n1 = _copy_tree(_app_source_dir(), plugin_dir / "lceda_plugin")
     n2 = _copy_tree(_kipy_src(), plugin_dir / "kipy")
+    _fetch_pip_pyz(plugin_dir)
     print(f"主代码 {n1} 个文件, kipy {n2} 个文件")
 
     # PCM 元数据(archive 内不得含 download_* 键)

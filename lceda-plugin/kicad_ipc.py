@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from .settings import Settings
@@ -29,6 +30,19 @@ class KiCadBusyError(RuntimeError):
 
 class LibraryNotLoaded(RuntimeError):
     """库表条目是 KiCad 启动后注册的,KiCad 内存中尚无该库(需重启一次)。"""
+
+
+def _diag(msg: str) -> None:
+    """轻量诊断日志(~/.cache/lceda-kicad-plugin/ipc.log)。"""
+    try:
+        from datetime import datetime  # noqa: PLC0415
+
+        d = Path.home() / ".cache" / "lceda-kicad-plugin"
+        d.mkdir(parents=True, exist_ok=True)
+        with open(d / "ipc.log", "a", encoding="utf-8") as fh:
+            fh.write(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] {msg}\n")
+    except OSError:
+        pass
 
 
 @dataclass
@@ -135,9 +149,16 @@ class KicadBridge:
             if "not found" in str(ex).lower():
                 raise LibraryNotLoaded(
                     f"{self.settings.library_nickname} 库尚未被 KiCad 加载:"
-                    "库表是在 KiCad 启动后注册的,请关闭并重新打开原理图"
-                    "(或重启 KiCad)后重试;此步骤仅需一次。") from ex
+                    "库表是在 KiCad 启动后注册的,请重启 KiCad 后重试;"
+                    "此步骤仅需一次。") from ex
             raise
+
+        # 诊断(不拦截):get_library_symbol 只查询 KiCad"已加载"的库,
+        # 启动后惰性未加载的库这里查不到,但放置路径仍可能按需解析成功,
+        # 以它做硬拦截会造成误报(现象:重启后仍提示未加载)。
+        if not self._retry(lambda: self.library_has_symbol(symbol_name)):
+            self._diag(f"预检未见 {lib_id}(库可能尚未加载);继续尝试放置")
+
         from kipy.geometry import Vector2  # noqa: PLC0415
 
         # 能力检测:旧版 kipy 无 interactive 参数 → 自动降级为程序化直落
@@ -147,9 +168,31 @@ class KicadBridge:
         if interactive and not supports:
             interactive = False
 
-        instance = self._retry(lambda: sch.place_symbol_from_library(
-            lib_id, Vector2.from_xy_mm(position_mm[0], position_mm[1]),
-            interactive=interactive))
+        def _place() -> Any:
+            return sch.place_symbol_from_library(
+                lib_id, Vector2.from_xy_mm(position_mm[0], position_mm[1]),
+                interactive=interactive)
+
+        try:
+            instance = self._retry(_place)
+        except Exception as ex:  # noqa: BLE001
+            low = str(ex).lower()
+            if "not found" in low and symbol_name.lower() in low:
+                # 再给一轮机会:库可能在异步加载中,重载后重试一次
+                self._diag(f"放置 {lib_id} 报 not found;重试一轮 reload+放置")
+                try:
+                    self.reload_symbol_library()
+                except Exception:  # noqa: BLE001
+                    pass
+                if self._retry(lambda: self.library_has_symbol(symbol_name)):
+                    instance = self._retry(_place)
+                else:
+                    raise LibraryNotLoaded(
+                        f"KiCad 进程尚未加载 {self.settings.library_nickname} "
+                        f"库(无法放置 {lib_id})。库表条目晚于 KiCad 启动,"
+                        "请重启 KiCad 后重试;仅需一次。") from ex
+            else:
+                raise
 
         if interactive:
             return symbol_name

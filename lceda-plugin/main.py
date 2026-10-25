@@ -23,6 +23,7 @@ if _KICAD_PYTHON.is_dir():
 
 from PySide6.QtCore import Qt, QThread, Signal
 from PySide6.QtGui import QPixmap
+from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import (
     QApplication, QDialog, QHeaderView, QLabel, QLineEdit, QListWidget,
     QMainWindow, QPushButton, QTableWidget, QTableWidgetItem, QTabWidget,
@@ -261,6 +262,42 @@ class FootprintPickerDialog(QDialog):
             self.accept()
 
 
+class PreviewWorker(QThread):
+    """后台下载预览图(网络慢时绝不阻塞 UI);done 回传 QPixmap|None。"""
+
+    done = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, client: LcedaClient, url: str) -> None:
+        super().__init__()
+        self.client, self.url = client, url
+
+    def run(self) -> None:
+        try:
+            data = self.client.fetch_image(self.url)
+            pm = QPixmap()
+            self.done.emit(pm if pm.loadFromData(data) else None)
+        except Exception as ex:  # noqa: BLE001
+            self.failed.emit(_fmt_err(ex))
+
+
+class QuietWorker(QThread):
+    """后台跑任意无返回值函数;异常静默(选中联动等轻量任务)。
+
+    KiCad 忙时 IPC 会阻塞重试数秒,绝不能在 UI 线程直接调用。
+    """
+
+    def __init__(self, fn) -> None:
+        super().__init__()
+        self._fn = fn
+
+    def run(self) -> None:
+        try:
+            self._fn()
+        except Exception:  # noqa: BLE001 - 联动失败静默
+            pass
+
+
 class SearchWorker(QThread):
     done = Signal(list)
     failed = Signal(str)
@@ -299,12 +336,19 @@ class PlaceWorker(QThread):
         comp = self.comp
         try:
             self.minimize_requested.emit()
-            self.log.emit(f"[1/4] 下载符号 {comp.title}")
+            symbol_name = self.pipeline.symbol_name(comp)
             fp_name = self.pipeline.footprint_name(comp)
             fp_ref = f"{self.pipeline.settings.library_nickname}:{fp_name}"
-            # 字段(Footprint/Supplier/Supplier Part/Value)全部预置于库符号,
-            # 交互式放置落位后元件自动携带
-            symbol_name = self.pipeline.ingest_symbol(comp, footprint_ref=fp_ref)
+            if self.pipeline.symbol_in_lib(symbol_name):
+                # 本地优先:库中已有该符号则直接放置,不重复下载/写库
+                # (避免无谓的网络往返与读改写风险敞口)
+                self.log.emit(f"[1/4] 本地库已有 {symbol_name},跳过下载")
+            else:
+                self.log.emit(f"[1/4] 下载符号 {comp.title}")
+                # 字段(Footprint/Supplier/Supplier Part/Value)全部预置于库符号,
+                # 交互式放置落位后元件自动携带
+                symbol_name = self.pipeline.ingest_symbol(
+                    comp, footprint_ref=fp_ref)
 
             self.log.emit(f"[2/4] 交互放置 {fp_ref}(元件跟随鼠标,左键落位,"
                           "可连续点击多放,Esc 结束)")
@@ -390,6 +434,9 @@ class MainWindow(QMainWindow):
         self._fp_cache: list[str] | None = None
         self._workers: list[QThread] = []
         self._place_count = 0
+        self._preview_seq = 0        # 预览请求代次:快速切行时丢弃旧响应
+        self._place_queue: list[tuple[LcedaComponent, tuple[float, float]]] = []
+        self._place_running = False
 
         tabs = QTabWidget()
         tabs.addTab(self._build_place_tab(), "搜索放置")
@@ -586,25 +633,42 @@ class MainWindow(QMainWindow):
             self._show_preview(c)
 
     def _show_preview(self, comp: LcedaComponent) -> None:
-        """单击结果行,更新页内右侧预览面板(图片 + 简介)。"""
+        """单击结果行,更新页内右侧预览面板(图片后台加载,不阻塞 UI)。"""
         self._pv_title.setText(f"{comp.title}   {comp.part_number or ''}")
-        pixmap = None
-        if comp.images:
-            try:
-                data = self.client.fetch_image(comp.images[0])
-                pixmap = QPixmap()
-                pixmap.loadFromData(data)
-            except Exception as ex:  # noqa: BLE001 - 图片失败不影响选择
-                self._log.append(f"[预览图加载失败] {_fmt_err(ex)}")
-        if pixmap is not None:
-            self._pv_img.setPixmap(pixmap.scaled(
-                self._pv_img.width(), self._pv_img.height(),
-                Qt.AspectRatioMode.KeepAspectRatio,
-                Qt.TransformationMode.SmoothTransformation))
-        else:
+        self._pv_desc.setText(comp.description.replace("\r\n", "\n").strip())
+
+        self._preview_seq += 1
+        seq = self._preview_seq
+        if not comp.images:
             self._pv_img.clear()
             self._pv_img.setText("无预览图")
-        self._pv_desc.setText(comp.description.replace("\r\n", "\n").strip())
+            return
+        self._pv_img.clear()
+        self._pv_img.setText("预览图加载中…")
+        w = PreviewWorker(self.client, comp.images[0])
+
+        def _apply(pm) -> None:
+            if seq != self._preview_seq:
+                return              # 已切到其它行,丢弃过期响应
+            if pm is None:
+                self._pv_img.clear()
+                self._pv_img.setText("无预览图")
+            else:
+                self._pv_img.setPixmap(pm.scaled(
+                    self._pv_img.width(), self._pv_img.height(),
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation))
+
+        def _fail(msg: str) -> None:
+            self._log.append(f"[预览图加载失败] {msg}")
+            if seq == self._preview_seq:
+                self._pv_img.clear()
+                self._pv_img.setText("预览图加载失败")
+
+        w.done.connect(_apply)
+        w.failed.connect(_fail)
+        self._track(w)
+        w.start()
 
     def on_preview_place(self) -> None:
         """预览面板底部的放置按钮:放置当前预览的元件。"""
@@ -628,17 +692,36 @@ class MainWindow(QMainWindow):
                                 "请确认 KiCad 已启动且原理图已打开,"
                                 "然后关闭本窗口并从工具栏图标重新打开插件。")
             return
-        # 连续放置:网格错开避免重叠;落位后符号自动选中,按 M 微调到目标位置
+        # 连续放置:网格错开避免重叠;落位后符号自动选中,按 M 微调到目标位置。
+        # 串行队列执行:并发放置会争用库写入与 KiCad IPC(reload/place 交错
+        # 导致偶发 not found,且多个 IPC 大请求排队会让 KiCad 假死)。
         pos = (120.0 + (self._place_count % 5) * 25.4,
                60.0 + (self._place_count // 5) * 25.4)
         self._place_count += 1
+        self._place_queue.append((comp, pos))
+        if len(self._place_queue) > 1:
+            self._log.append(
+                f"[排队] {comp.title}(前面还有 {len(self._place_queue) - 1} 个)")
+        self._maybe_start_place()
+
+    def _maybe_start_place(self) -> None:
+        if self._place_running or not self._place_queue:
+            return
+        comp, pos = self._place_queue.pop(0)
+        self._place_running = True
         w = PlaceWorker(self.pipeline, self.bridge, comp, pos)
         w.log.connect(self._log.append)   # 信号必须连接到方法,不能直接连接控件
         w.minimize_requested.connect(self.showMinimized)
         w.placed.connect(lambda m: self._log.append(f"[已放置] {m}"))
         w.failed.connect(self._on_place_failed)
+        w.finished.connect(self._place_finished)
         self._track(w)
         w.start()
+
+    def _place_finished(self) -> None:
+        self._place_running = False
+        if self._place_queue:
+            self._maybe_start_place()
 
     def _on_place_failed(self, msg: str) -> None:
         self._log.append(f"[放置失败] {msg}")
@@ -651,11 +734,13 @@ class MainWindow(QMainWindow):
         infos = self._selected_symbol_infos()
         if len(infos) != 1:
             return
-        try:
-            self.bridge.select_symbol(infos[0].internal_id)
-            self.bridge.focus_symbol(infos[0].internal_id)
-        except Exception:  # noqa: BLE001 - 联动失败静默
-            pass
+        info = infos[0]
+
+        def _link() -> None:
+            self.bridge.select_symbol(info.internal_id)
+            self.bridge.focus_symbol(info.internal_id)
+
+        self._track(QuietWorker(_link))
 
     def on_refresh_symbols(self) -> None:
         w = ListSymbolsWorker(self.bridge)
@@ -718,11 +803,11 @@ class MainWindow(QMainWindow):
         # 无论成败都强制重读:成功→反映新字段;失败→反映真实状态(过滤条件保留)
         self.on_refresh_symbols()
         # 视图聚焦到被替换的元件(高亮 + 居中),便于确认结果
-        try:
+        def _link() -> None:
             self.bridge.select_symbol(internal_id)
             self.bridge.focus_symbol(internal_id)
-        except Exception:  # noqa: BLE001
-            pass
+
+        self._track(QuietWorker(_link))
 
     def _show_batch_report(self, report: BatchReport) -> None:
         for ref, fp in report.success:
@@ -795,8 +880,36 @@ class MainWindow(QMainWindow):
 
 def main() -> int:
     app = QApplication(sys.argv)
+
+    # ── 单实例:再次点击 KiCad 工具栏图标时唤起已有窗口,不新建进程 ──
+    KEY = f"lceda-kicad-plugin-{getattr(os, 'getuid', lambda: 0)()}"
+    probe = QLocalSocket()
+    probe.connectToServer(KEY)
+    if probe.waitForConnected(300):
+        probe.write(b"raise")          # 通知旧实例弹窗,本进程直接退出
+        probe.flush()
+        probe.waitForBytesWritten(300)
+        return 0
+    QLocalServer.removeServer(KEY)     # 清理上次异常退出残留的 socket
+    server = QLocalServer()
+    server.listen(KEY)
+
     win = MainWindow()
     win.show()
+
+    def _raise_existing() -> None:
+        sock = server.nextPendingConnection()
+        if sock is None:
+            return
+        sock.readAll()                 # 消费消息;连接由对端关闭
+        if win.isMinimized():
+            win.setWindowState(
+                win.windowState() & ~Qt.WindowState.WindowMinimized)
+        win.show()
+        win.raise_()
+        win.activateWindow()
+
+    server.newConnection.connect(_raise_existing)
     return app.exec()
 
 

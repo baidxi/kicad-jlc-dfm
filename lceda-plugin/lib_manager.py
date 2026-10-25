@@ -14,11 +14,64 @@ import fcntl
 import os
 import re
 import tempfile
+import threading
+import time
 from pathlib import Path
 
 from .settings import Settings
 
 _LOCK_DIR = Path.home() / ".cache" / "lceda-kicad-plugin"
+_BACKUP_DIR = _LOCK_DIR / "backups"
+
+_THR_LOCKS: dict[str, threading.Lock] = {}
+_THR_LOCKS_GUARD = threading.Lock()
+
+
+def _thr_lock(name: str) -> threading.Lock:
+    """进程内互斥(flock 之外的双保险,防同进程线程竞态)。"""
+    with _THR_LOCKS_GUARD:
+        return _THR_LOCKS.setdefault(name, threading.Lock())
+
+
+def _balanced(text: str) -> bool:
+    """s-表达式括号平衡检查(跳过字符串字面量)。"""
+    depth = 0
+    in_str = False
+    for i, c in enumerate(text):
+        if c == '"' and (i == 0 or text[i - 1] != "\\"):
+            in_str = not in_str
+        elif not in_str:
+            if c == "(":
+                depth += 1
+            elif c == ")":
+                depth -= 1
+                if depth < 0:
+                    return False
+    return depth == 0
+
+
+def _backup(path: Path, keep: int = 5) -> None:
+    """写前快照(保留最近 keep 份),供损坏自愈。"""
+    if not path.exists():
+        return
+    _BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    target = _BACKUP_DIR / f"{path.stem}-{stamp}{path.suffix}"
+    try:
+        target.write_bytes(path.read_bytes())
+    except OSError:
+        return
+    backups = sorted(_BACKUP_DIR.glob(f"{path.stem}-*{path.suffix}"))
+    for old in backups[:-keep]:
+        with contextlib.suppress(OSError):
+            old.unlink()
+
+
+def _latest_backup(path: Path) -> Path | None:
+    if not _BACKUP_DIR.is_dir():
+        return None
+    found = sorted(_BACKUP_DIR.glob(f"{path.stem}-*{path.suffix}"))
+    return found[-1] if found else None
 
 
 @contextlib.contextmanager
@@ -131,20 +184,57 @@ def _remove_symbol_block(lib_text: str, name: str) -> str:
     return lib_text[:start] + lib_text[i:]
 
 
+def symbol_exists(settings: Settings, name: str) -> bool:
+    """本地符号库是否已含指定符号(供放置本地优先判断)。"""
+    try:
+        return f'(symbol "{name}"' in settings.sym_lib_file.read_text(
+            encoding="utf-8")
+    except OSError:
+        return False
+
+
 def add_symbol(settings: Settings, name: str, symbol_text: str) -> None:
-    """向符号库追加/替换一个 symbol(symbol_text 为单个 (symbol ...) 块)。"""
+    """向符号库追加/替换一个 symbol(symbol_text 为单个 (symbol ...) 块)。
+
+    双重互斥(进程内 threading.Lock + 跨进程 flock);写前平衡校验与快照
+    备份、写后回读校验 —— 防半写、旧快照覆盖与外部工具写坏,损坏时自动
+    从最近备份自愈。
+    """
     ensure_symbol_lib(settings)
-    with _file_lock("symbol_lib"):
-        lib_text = settings.sym_lib_file.read_text(encoding="utf-8")
+    lib = settings.sym_lib_file
+    with _thr_lock("symbol_lib"), _file_lock("symbol_lib"):
+        lib_text = lib.read_text(encoding="utf-8")
+        if not _balanced(lib_text):
+            bak = _latest_backup(lib)
+            if bak is None or not _balanced(bak.read_text(encoding="utf-8")):
+                raise RuntimeError(f"符号库括号不平衡且无可用备份: {lib}")
+            lib_text = bak.read_text(encoding="utf-8")
+            _atomic_write(lib, lib_text)   # 自愈:回到最近完好快照
+
+        _backup(lib)
+
         lib_text = _remove_symbol_block(lib_text, name)
         block = symbol_text.rstrip()
         if not block.startswith("(symbol "):
             raise ValueError("symbol_text 必须是单个 (symbol ...) 块")
+        if not _balanced(block):
+            # 旧版转换器/extract 的坏块会多带 lib 闭合括号,全文平衡可能
+            # 被后续写入"补偿性"抵消,必须按单块校验
+            raise RuntimeError(f"符号块括号不平衡,已拒绝写入: {name}")
         closing = lib_text.rfind(")")
         if closing < 0:
-            raise ValueError(f"符号库格式异常: {settings.sym_lib_file}")
-        lib_text = lib_text[:closing] + block + "\n" + lib_text[closing:]
-        _atomic_write(settings.sym_lib_file, lib_text)
+            raise ValueError(f"符号库格式异常: {lib}")
+        new_text = lib_text[:closing] + block + "\n" + lib_text[closing:]
+        if not _balanced(new_text):
+            raise RuntimeError(f"新符号块导致括号不平衡,已拒绝写入: {name}")
+        _atomic_write(lib, new_text)
+
+        # 写后回读:确认落盘内容含新符号且平衡(防滞后覆盖/半写)
+        check = lib.read_text(encoding="utf-8")
+        if not _balanced(check) or f'(symbol "{name}"' not in check:
+            raise RuntimeError(
+                f"符号库写入校验失败(可能被外部进程覆盖): {lib};"
+                f"写前快照保留在 {_BACKUP_DIR}")
 
 
 # ── 封装库(一封装一文件) ──
@@ -161,9 +251,11 @@ def ensure_footprint_lib(settings: Settings) -> Path:
 
 def add_footprint(settings: Settings, name: str, fp_text: str) -> Path:
     """写入单个封装文件(覆盖语义:先删后写,Unix O_EXCL 兜底)。"""
+    if not _balanced(fp_text):
+        raise RuntimeError(f"封装文本括号不平衡,已拒绝写入: {name}")
     lib_dir = ensure_footprint_lib(settings)
     target = lib_dir / f"{name}.kicad_mod"
-    with _file_lock("footprint_lib"):
+    with _thr_lock("footprint_lib"), _file_lock("footprint_lib"):
         if target.exists():
             target.unlink()
         _atomic_write(target, fp_text)

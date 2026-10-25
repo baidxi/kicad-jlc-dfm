@@ -69,6 +69,7 @@ jobs:
           assert "plugins/lceda-kicad-plugin/plugin.json" in names, "missing plugin manifest"
           assert any(n.endswith("lceda_plugin/main.py") for n in names), "missing app code"
           assert any(n.endswith("kipy/__init__.py") for n in names), "missing bundled kipy"
+          assert any(n.endswith("pip.pyz") for n in names), "missing bundled pip.pyz"
           print("package contents OK")
           EOF
 

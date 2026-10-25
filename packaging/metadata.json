@@ -2,7 +2,7 @@
   "$schema": "https://go.kicad.org/pcm/v2/schema/package",
   "name": "LCSC KiCad Integration",
   "description": "立创商城元件搜索、交互式放置与批量封装更新",
-  "description_full": "立创商城(LCSC)元件与 KiCad 的一体化集成:\n\n- 在线搜索立创元件(关键词或 C 编号)\n- 交互式放置到原理图(元件跟随鼠标,左键落位,可连续放置)\n- 自动下载符号/封装/3D 模型到全局库并关联(Footprint 与 Supplier 字段自动写入)\n- 批量修改封装:按 Supplier Part 编号在线更新 / 手动指定 / 通用件手动搜索绑定\n- 支持 STEP 与 WRL 3D 模型,自动注入封装 (model) 子句\n\n需要 KiCad 10.99+ 且启用 IPC API。若你的 KiCad 含 interactive 放置扩展补丁,可获得完整鼠标跟随体验;否则元件直接落在网格位后用 M 移动。",
+  "description_full": "立创商城(LCSC)元件与 KiCad 的一体化集成:\n\n- 在线搜索立创元件(关键词或 C 编号)\n- 交互式放置到原理图(元件跟随鼠标,左键落位,可连续放置)\n- 自动下载符号/封装/3D 模型到全局库并关联(Footprint 与 Supplier 字段自动写入)\n- 批量修改封装:按 Supplier Part 编号在线更新 / 手动指定 / 通用件手动搜索绑定\n- 支持 STEP 与 WRL 3D 模型,自动注入封装 (model) 子句\n\n需要 KiCad 10.99+ 且启用 IPC API。若你的 KiCad 含 interactive 放置扩展补丁,可获得完整鼠标跟随体验;否则元件直接落在网格位后用 M 移动。\n\nPython 依赖(PySide6/httpx/cryptography)在首次启动时自动用 pip 安装(需联网,约 200 MB);kipy 随包内置,离线环境请提前执行 pip install --user PySide6 httpx cryptography kicad-python。",
   "identifier": "tools.juno.lceda-kicad-plugin",
   "type": "plugin",
   "author": {

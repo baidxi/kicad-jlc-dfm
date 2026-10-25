@@ -8,7 +8,8 @@
 ## 环境要求
 
 - KiCad 10.99(IPC API 开启,kipy 0.9.0.dev0)
-- Python 包:`PySide6` `httpx` `cryptography`
+- Python 包:`PySide6` `httpx` `cryptography` —— **首次启动自动安装**(见下);
+  离线环境可提前 `pip install --user PySide6 httpx cryptography kicad-python`
 
 ## 安装
 
@@ -19,8 +20,15 @@ python3 packaging/build_pcm.py        # 构建并校验 → dist/lceda-kicad-plu
 ```
 
 KiCad → 插件管理器 → ⋮ → 「从文件安装…」→ 选择 zip → 应用。
-重启 KiCad 后 eeschema 工具栏出现橙色 L 图标。包自包含(含 kipy),无需 pip 装任何东西;
-运行时依赖 `PySide6` / `httpx` / `cryptography`(系统 Python 可见即可)。
+重启 KiCad 后 eeschema 工具栏出现橙色 L 图标。包自包含(含 kipy);
+**首次点击图标时**入口自动检测缺失依赖并用 pip 补齐 `PySide6` / `httpx` /
+`cryptography`(约 200 MB,需联网,可能持续数分钟,期间无窗口属正常,
+装完直接进入 GUI,无需重启 KiCad)。全过程与失败原因记录在插件目录
+`lceda-plugin-error.log`;设环境变量 `LCEDA_NO_AUTOINSTALL=1` 可关闭自动安装。
+(kipy 的传递依赖 pynng/protobuf/zstandard/jsonschema 缺失时同样自动补齐。)
+国内网络可设 `LCEDA_PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple`
+走清华镜像加速。系统无 python3-pip 时(如全新 Ubuntu 24.04)由随包分发的
+`pip.pyz` 兜底引导,无需预装任何东西。
 
 **方式二:开发者运行**(改动代码即时生效)
 

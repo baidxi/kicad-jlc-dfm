@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import gzip
+import hashlib
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -24,6 +25,9 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 _PRO_BASE = "https://pro.lceda.cn"
 _STEP_BASE = "https://modules.lceda.cn/qAxj6KHrDKw4blvCG8QJPs7Y"
 _TAG_SIZE = 16
+
+# 预览图磁盘缓存(跨进程/跨会话复用,内存 → 磁盘 → 网络三级)
+_IMG_CACHE_DIR = Path.home() / ".cache" / "lceda-kicad-plugin" / "images"
 
 _LCSC_PART_RE = re.compile(r"[Cc]\d{4,}")
 
@@ -170,14 +174,26 @@ class LcedaClient:
     # ── 3D 模型(STEP) ──
 
     def fetch_image(self, url: str) -> bytes:
-        """下载元件预览图(协议相对 URL 补 https:;带进程内缓存)。"""
+        """下载元件预览图(协议相对 URL 补 https:;内存 + 磁盘双层缓存)。"""
         if not url.startswith("http"):
             url = "https:" + url
         cached = self._img_cache.get(url)
         if cached is not None:
             return cached
+        disk = _IMG_CACHE_DIR / hashlib.sha1(url.encode()).hexdigest()
+        if disk.is_file():
+            data = disk.read_bytes()
+            self._img_cache[url] = data
+            return data
         data = self._client.get(url).content
         self._img_cache[url] = data
+        try:
+            _IMG_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+            tmp = disk.with_suffix(".tmp")
+            tmp.write_bytes(data)
+            tmp.replace(disk)          # 原子落盘,防半写
+        except OSError:
+            pass                        # 缓存是优化,失败不影响主流程
         return data
 
     def download_model(self, model3d_uuid: str, dest_dir: Any, base_name: str) -> Any:

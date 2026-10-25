@@ -36,6 +36,8 @@ class Pipeline:
         # uuid → 名称缓存(进程内去重)
         self._fp_names: dict[str, str] = {}
         self._step_names: dict[str, str] = {}
+        # 已确认在本地符号库中的符号名(放置本地优先,避免重复下载写库)
+        self._known_symbols: set[str] = set()
 
     # ── 命名 ──
 
@@ -48,6 +50,15 @@ class Pipeline:
         return get_safe_filename(comp.footprint_title or comp.title)
 
     # ── 同步段:符号 ──
+
+    def symbol_in_lib(self, name: str) -> bool:
+        """本地符号库是否已含该符号(内存缓存 + 文件实查双确认)。"""
+        if name in self._known_symbols:
+            return True
+        if lib_manager.symbol_exists(self.settings, name):
+            self._known_symbols.add(name)
+            return True
+        return False
 
     def ingest_symbol(self, comp: LcedaComponent,
                       footprint_ref: str | None = None) -> str:
@@ -65,6 +76,7 @@ class Pipeline:
             supplier="LCSC" if comp.part_number else None,
             supplier_part=comp.part_number)
         lib_manager.add_symbol(self.settings, name, conv.extract_symbol_block(text))
+        self._known_symbols.add(name)
         return name
 
     # ── 后台段:封装 + 3D ──
