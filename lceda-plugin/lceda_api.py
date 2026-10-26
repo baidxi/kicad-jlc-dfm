@@ -15,6 +15,7 @@ from __future__ import annotations
 import gzip
 import hashlib
 import re
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -26,8 +27,12 @@ _PRO_BASE = "https://pro.lceda.cn"
 _STEP_BASE = "https://modules.lceda.cn/qAxj6KHrDKw4blvCG8QJPs7Y"
 _TAG_SIZE = 16
 
-# 预览图磁盘缓存(跨进程/跨会话复用,内存 → 磁盘 → 网络三级)
-_IMG_CACHE_DIR = Path.home() / ".cache" / "lceda-kicad-plugin" / "images"
+# 预览图磁盘缓存(跨进程/跨会话复用,内存 → 磁盘 → 网络三级;
+# Windows 放 %LOCALAPPDATA% 惯例位置,路径按 OS 类型推导)
+if sys.platform == "win32":
+    _IMG_CACHE_DIR = Path.home() / "AppData" / "Local" / "lceda-kicad-plugin" / "images"
+else:
+    _IMG_CACHE_DIR = Path.home() / ".cache" / "lceda-kicad-plugin" / "images"
 
 _LCSC_PART_RE = re.compile(r"[Cc]\d{4,}")
 

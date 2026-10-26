@@ -25,6 +25,7 @@ pip 来源:-m pip → ensurepip 引导 → 随包分发的官方 zipapp pip.pyz
 from __future__ import annotations
 
 import importlib
+import io
 import os
 import site
 import subprocess
@@ -32,22 +33,30 @@ import sys
 import types
 from pathlib import Path
 
+# KiCad Windows 用 pythonw.exe 启动插件:sys.stdout/stderr 为 None,
+# 任何 print 都会二次崩溃;替换为丢弃型流
+if sys.stdout is None:
+    sys.stdout = io.StringIO()
+if sys.stderr is None:
+    sys.stderr = io.StringIO()
+
 PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
 DEV_ROOT = "/home/juno/tools/kicad-jlc-dfm"
 LOG_FILE = os.path.join(PLUGIN_DIR, "lceda-plugin-error.log")
 INSTALL_TIMEOUT = 1800  # PySide6 较大,慢网放宽到 30 分钟
 
-# 顶层 import 名 → pip 安装清单。kipy 必须列出其全部运行时依赖:
-# PyPI 的 kicad-python(0.8.0)不声明 zstandard,而 bundled kipy
-# (0.9.0 fork)import 需要它——只装 kicad-python 会陷入
-# "pip 已满足却仍缺依赖"的死循环(版本约束与 fork 的 pyproject 一致)。
+# 顶层 import 名 → pip 安装清单。
+# kipy 本体随包内置(用户 fork,含 interactive 扩展)且 sys.path 最高优先,
+# 永不从 PyPI 安装官方 kicad-python —— 官方旧版(0.8.0)签名有 interactive
+# 而 proto 没有该字段,混装曾导致 Windows 放置崩溃。此处只声明 fork 的
+# 运行时依赖(版本约束与 fork 的 pyproject 一致)。
 REQUIRED: dict[str, list[str]] = {
     "PySide6": ["PySide6"],
     "httpx": ["httpx"],
     "cryptography": ["cryptography"],
-    "kipy": ["kicad-python", "zstandard>=0.25,<0.26",
-             "protobuf>=5.29.6,<6", "pynng>=0.9,<0.10",
-             "jsonschema>=4.23,<5", "typing_extensions>=4.13.2"],
+    "kipy": ["pynng>=0.9,<0.10", "protobuf>=5.29.6,<6",
+             "zstandard>=0.25,<0.26", "jsonschema>=4.23,<5",
+             "typing_extensions>=4.13.2"],
 }
 
 
@@ -72,6 +81,16 @@ def _log_env() -> None:
          f"version={sys.version.split()[0]} "
          f"user_site={user_sp} "
          f"user_site_enabled={getattr(site, 'ENABLE_USER_SITE', '?')}")
+
+
+def _diag_kipy_source() -> None:
+    """记录 kipy 实际解析位置:应为随包 fork(bundled 优先于任何 site-packages)。"""
+    try:
+        spec = importlib.util.find_spec("kipy")
+        _log(f"kipy 解析位置: {spec.origin if spec else '?'}"
+             "(应为插件目录内 kipy/__init__.py)")
+    except Exception as exc:  # noqa: BLE001
+        _log(f"kipy 解析失败: {exc}")
 
 
 def _extend_paths() -> None:
@@ -200,14 +219,19 @@ def _pip_install(launcher: list[str], pkgs: list[str]) -> bool:
         _log("$ " + " ".join(cmd))
         try:
             proc = subprocess.run(cmd, capture_output=True, text=True,
-                                  timeout=INSTALL_TIMEOUT)
+                                  timeout=INSTALL_TIMEOUT,
+                                  encoding="utf-8", errors="replace")
         except (OSError, subprocess.TimeoutExpired) as exc:
             _log(f"pip 运行异常: {exc}")
             continue
         if proc.returncode == 0:
             return True
-        out = ((proc.stderr or "") + (proc.stdout or "")).strip()
-        _log(f"pip 失败(rc={proc.returncode}):{out[-2000:]}")
+        # stderr(真正错误)优先完整保留,stdout(下载进度)只留尾部;
+        # 合并截断会把错误淹没在进度条里
+        err_tail = (proc.stderr or "").strip()[-1500:]
+        out_tail = (proc.stdout or "").strip()[-1500:]
+        _log(f"pip 失败(rc={proc.returncode}) stderr: {err_tail or '(空)'}")
+        _log(f"pip stdout 尾部: {out_tail}")
     return False
 
 
@@ -269,6 +293,7 @@ def main() -> int:
     missing = _missing()
     if missing:
         _log_env()
+        _diag_kipy_source()
     if missing and not os.environ.get("LCEDA_NO_AUTOINSTALL"):
         if _bootstrap(missing):
             # 安装后 user site 目录才存在,重新纳入 sys.path 并刷新导入

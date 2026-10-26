@@ -64,23 +64,35 @@ def _fetch_pip_pyz(plugin_dir: Path) -> bool:
 
 
 def _kipy_src() -> Path:
-    """kipy 源目录:优先用户 fork 的优化版(含 interactive 扩展)。
+    """kipy 源目录(优先级):仓库 submodule 锁定副本优先。
 
-    顺序:
-      1. 已安装的 kipy —— CI 从用户 fork 安装,含交互放置优化
-      2. 仓库内 kicad-python/kipy —— 本地开发副本(同样含扩展)
-      3. 兜底:任意已安装 kipy
+    submodule 指向 baidxi fork 的固定 commit —— 与本地验证过的产物
+    完全同源,不受 CI 上 `git+https` 默认拉 main 最新(其内容可能变化)
+    的影响。已安装 kipy 仅作开发环境兜底。
     """
-    import kipy  # noqa: PLC0415
-
-    installed = Path(kipy.__file__).parent
     repo_copy = APP_ROOT / "kicad-python" / "kipy"
-
-    if _has_interactive(installed):
-        return installed
     if repo_copy.is_dir() and _has_interactive(repo_copy):
         return repo_copy
-    return installed
+
+    try:
+        import kipy  # noqa: PLC0415
+
+        installed = Path(kipy.__file__).parent
+        if _has_interactive(installed):
+            print(f"kipy 源: 已安装 {installed}(仓库副本缺失或无 interactive)")
+            return installed
+    except ImportError:
+        pass
+
+    if repo_copy.is_dir():
+        print("[warn] 仓库与已安装 kipy 均无 interactive,使用仓库副本"
+              "(交互放置将降级,CI 断言会拦截)")
+        return repo_copy
+
+    import kipy  # noqa: PLC0415
+
+    print("[warn] 无仓库副本,使用已安装 kipy(交互放置将降级)")
+    return Path(kipy.__file__).parent
 
 
 def _app_source_dir() -> Path:

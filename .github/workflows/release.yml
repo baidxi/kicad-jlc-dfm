@@ -28,17 +28,19 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          # 递归同步:kicad 源码(baidxi/kicad fork,含 interactive 补丁)
+          # 是 kicad-python 的内嵌子模块,Generate 步骤需要它的 api/proto
+          submodules: recursive
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
-      - name: Install kipy (fork with interactive place support)
-        run: |
-          python3 -m pip install --upgrade pip
-          pip install "kicad-python @ git+https://github.com/baidxi/kicad-python.git"
-
+      # 说明:不 pip install kicad-python —— fork 已清除 kicad 子模块,
+      # 源码安装需 protoc 重新生成 proto 必然失败;打包与校验均使用
+      # checkout 的 submodule 副本(kipy pb2 已生成并提交)。
       - name: Resolve version
         id: ver
         run: |
@@ -53,10 +55,29 @@ jobs:
             echo "is_tag=false" >> "$GITHUB_OUTPUT"
           fi
 
+      # proto 单一来源 = baidxi/kicad(kicad-python 的内嵌子模块,含
+      # interactive 补丁)。submodules: recursive 递归检出后现场生成 pb2,
+      # 生成物不入库(官方做法)。
+      - name: Generate kipy protobuf wrappers
+        run: |
+          sudo apt-get update -q && sudo apt-get install -y -q protobuf-compiler
+          protoc --version
+          pip install "protobuf>=5.29,<6" "mypy-protobuf==3.6.0" protoletariat
+          PYTHONPATH="$GITHUB_WORKSPACE/kicad-python" \
+            python3 kicad-python/tools/generate_protos.py \
+            --input "$GITHUB_WORKSPACE/kicad-python/kicad/api/proto" \
+            --output "$GITHUB_WORKSPACE/kicad-python/kipy/proto"
+
       - name: Build PCM package
         run: |
           echo "Package version: ${{ steps.ver.outputs.version }}"
-          python3 packaging/build_pcm.py --version "${{ steps.ver.outputs.version }}"
+          python3 packaging/build_pcm.py --no-validate --version "${{ steps.ver.outputs.version }}"
+
+      - name: Validate package (kipy from submodule copy)
+        run: |
+          pip install jsonschema protobuf
+          PYTHONPATH="$GITHUB_WORKSPACE/kicad-python" \
+            python3 -m kipy.packaging.cli validate dist/*-pcm.zip
 
       - name: Check package contents
         run: |
@@ -70,6 +91,9 @@ jobs:
           assert any(n.endswith("lceda_plugin/main.py") for n in names), "missing app code"
           assert any(n.endswith("kipy/__init__.py") for n in names), "missing bundled kipy"
           assert any(n.endswith("pip.pyz") for n in names), "missing bundled pip.pyz"
+          pb2 = zipfile.ZipFile(zips[0]).read(
+              "plugins/lceda-kicad-plugin/kipy/proto/schematic/schematic_commands_pb2.py")
+          assert b"interactive" in pb2, "bundled kipy 缺 interactive 扩展(应来自 baidxi fork)"
           print("package contents OK")
           EOF
 

@@ -33,11 +33,15 @@ class LibraryNotLoaded(RuntimeError):
 
 
 def _diag(msg: str) -> None:
-    """轻量诊断日志(~/.cache/lceda-kicad-plugin/ipc.log)。"""
+    """轻量诊断日志(缓存目录 ipc.log;Windows 位于 %LOCALAPPDATA% 惯例位置)。"""
     try:
+        import os  # noqa: PLC0415
         from datetime import datetime  # noqa: PLC0415
 
-        d = Path.home() / ".cache" / "lceda-kicad-plugin"
+        if os.name == "nt":
+            d = Path.home() / "AppData" / "Local" / "lceda-kicad-plugin"
+        else:
+            d = Path.home() / ".cache" / "lceda-kicad-plugin"
         d.mkdir(parents=True, exist_ok=True)
         with open(d / "ipc.log", "a", encoding="utf-8") as fh:
             fh.write(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] {msg}\n")
@@ -90,6 +94,9 @@ class KicadBridge:
     def connect(self) -> bool:
         """连接运行中的 KiCad 并获取打开的原理图;失败返回 False(降级纯下载模式)。"""
         try:
+            import kipy  # noqa: PLC0415
+
+            _diag(f"kipy 运行时路径: {kipy.__file__}")   # 排查混装(venv vs bundled)
             from kipy.kicad import KiCad  # 延迟导入:未装 kipy 时其余功能不受影响
             self._kicad = KiCad()
             self._kicad.get_version()  # 探活
@@ -161,12 +168,26 @@ class KicadBridge:
 
         from kipy.geometry import Vector2  # noqa: PLC0415
 
-        # 能力检测:旧版 kipy 无 interactive 参数 → 自动降级为程序化直落
+        # 能力检测:interactive 需要客户端签名与 proto 消息字段同时具备。
+        # 混装环境(venv 官方 kicad-python 与 bundled fork 并存)下可能出现
+        # "签名有 interactive 而 pb2 没有",只查签名会在写 proto 时抛
+        # AttributeError。不支持时降级为程序化直落(官方 KiCad 的预期行为)。
         import inspect  # noqa: PLC0415
         supports = "interactive" in inspect.signature(
             sch.place_symbol_from_library).parameters
+        if supports:
+            try:
+                from kipy.proto.schematic import (
+                    schematic_commands_pb2,  # noqa: PLC0415
+                )
+                supports = hasattr(
+                    schematic_commands_pb2.PlaceSymbolFromLibrary(),
+                    "interactive")
+            except Exception:  # noqa: BLE001
+                supports = False
         if interactive and not supports:
             interactive = False
+            _diag("KiCad/kipy 不支持 interactive 放置,降级为程序化直落")
 
         def _place() -> Any:
             return sch.place_symbol_from_library(

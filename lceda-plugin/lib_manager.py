@@ -10,7 +10,6 @@ IPC API 没有库内容创建能力(见规划 §3.3),库构建只能走文件:
 from __future__ import annotations
 
 import contextlib
-import fcntl
 import os
 import re
 import tempfile
@@ -20,11 +19,56 @@ from pathlib import Path
 
 from .settings import Settings
 
-_LOCK_DIR = Path.home() / ".cache" / "lceda-kicad-plugin"
+# 插件自有锁/缓存基目录(Windows 放 %LOCALAPPDATA% 惯例位置,路径由
+# OS 类型 + 标准相对路径推导,不依赖环境变量)
+if os.name == "nt":
+    _LOCK_DIR = Path.home() / "AppData" / "Local" / "lceda-kicad-plugin"
+else:
+    _LOCK_DIR = Path.home() / ".cache" / "lceda-kicad-plugin"
 _BACKUP_DIR = _LOCK_DIR / "backups"
 
 _THR_LOCKS: dict[str, threading.Lock] = {}
 _THR_LOCKS_GUARD = threading.Lock()
+
+if os.name == "nt":
+    import msvcrt
+
+    @contextlib.contextmanager
+    def _file_lock(name: str):
+        """Windows:msvcrt 字节范围锁(轮询等待,最长约 30 秒)。"""
+        _LOCK_DIR.mkdir(parents=True, exist_ok=True)
+        lock_path = _LOCK_DIR / f"{name}.lock"
+        with open(lock_path, "a+") as fh:
+            deadline = time.time() + 30
+            while True:
+                try:
+                    fh.seek(0)
+                    msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+                    break
+                except OSError:
+                    if time.time() > deadline:
+                        raise
+                    time.sleep(0.1)
+            try:
+                yield
+            finally:
+                with contextlib.suppress(OSError):
+                    fh.seek(0)
+                    msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+else:
+    import fcntl
+
+    @contextlib.contextmanager
+    def _file_lock(name: str):
+        """POSIX:flock 跨进程互斥。"""
+        _LOCK_DIR.mkdir(parents=True, exist_ok=True)
+        lock_path = _LOCK_DIR / f"{name}.lock"
+        with open(lock_path, "w") as fh:
+            fcntl.flock(fh, fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(fh, fcntl.LOCK_UN)
 
 
 def _thr_lock(name: str) -> threading.Lock:
@@ -75,17 +119,6 @@ def _latest_backup(path: Path) -> Path | None:
 
 
 @contextlib.contextmanager
-def _file_lock(name: str):
-    """进程间互斥锁(库文件与库表的关键区)。"""
-    _LOCK_DIR.mkdir(parents=True, exist_ok=True)
-    lock_path = _LOCK_DIR / f"{name}.lock"
-    with open(lock_path, "w") as fh:
-        fcntl.flock(fh, fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            fcntl.flock(fh, fcntl.LOCK_UN)
-
 
 def _atomic_write(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -109,7 +142,12 @@ def _lib_entry(nickname: str, uri: str, descr: str) -> str:
 
 def register_in_lib_table(table_path: Path, nickname: str, uri: str,
                           descr: str = "") -> bool:
-    """向库表幂等注册条目;返回是否发生修改。表不存在时创建空表。"""
+    """向库表幂等注册条目;返回是否发生修改。表不存在时创建空表。
+
+    URI 统一正斜杠:Windows 反斜杠在 s-expr 字符串中虽可解析,
+    但正斜杠在 KiCad 全平台(含路径变量替换)下最稳。
+    """
+    uri = str(uri).replace("\\", "/")
     with _file_lock("lib_table"):
         if table_path.exists():
             text = table_path.read_text(encoding="utf-8")
