@@ -75,7 +75,8 @@ jobs:
 
       - name: Validate package (kipy from submodule copy)
         run: |
-          pip install jsonschema protobuf
+          # cli 加载 kipy/__init__ 全链,需要 zstandard(protobuf 由 Generate 步骤装好)
+          pip install jsonschema "protobuf>=5.29,<6" zstandard
           PYTHONPATH="$GITHUB_WORKSPACE/kicad-python" \
             python3 -m kipy.packaging.cli validate dist/*-pcm.zip
 
