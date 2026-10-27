@@ -164,7 +164,7 @@ class KicadBridge:
         # 启动后惰性未加载的库这里查不到,但放置路径仍可能按需解析成功,
         # 以它做硬拦截会造成误报(现象:重启后仍提示未加载)。
         if not self._retry(lambda: self.library_has_symbol(symbol_name)):
-            self._diag(f"预检未见 {lib_id}(库可能尚未加载);继续尝试放置")
+            _diag(f"预检未见 {lib_id}(库可能尚未加载);继续尝试放置")
 
         from kipy.geometry import Vector2  # noqa: PLC0415
 
@@ -200,7 +200,7 @@ class KicadBridge:
             low = str(ex).lower()
             if "not found" in low and symbol_name.lower() in low:
                 # 再给一轮机会:库可能在异步加载中,重载后重试一次
-                self._diag(f"放置 {lib_id} 报 not found;重试一轮 reload+放置")
+                _diag(f"放置 {lib_id} 报 not found;重试一轮 reload+放置")
                 try:
                     self.reload_symbol_library()
                 except Exception:  # noqa: BLE001

@@ -29,6 +29,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
+          # 拉取 kicad-python 子模块;其内嵌 kicad 由后续步骤按 dist.sh 语义初始化
           submodules: true
 
       - name: Set up Python
@@ -36,9 +37,8 @@ jobs:
         with:
           python-version: "3.12"
 
-      # 说明:不 pip install kicad-python —— fork 已清除 kicad 子模块,
-      # 源码安装需 protoc 重新生成 proto 必然失败;打包与校验均使用
-      # checkout 的 submodule 副本(kipy pb2 已生成并提交)。
+      # 说明:不 pip install kicad-python —— 打包与校验均使用 checkout 的 submodule 副本,
+      # pb2/pyi/kicad_api_version.py 按 kicad-python 官方 dist.sh 流程现场生成(见下)。
       - name: Resolve version
         id: ver
         run: |
@@ -53,6 +53,27 @@ jobs:
             echo "is_tag=false" >> "$GITHUB_OUTPUT"
           fi
 
+      # ===== kicad-python 官方 dist.sh 的等价初始化 =====
+      # dist.sh 在 kicad-python 目录内执行两步:
+      #   1) git submodule update --init --recursive
+      #   2) poetry build → 经 pyproject [tool.poetry.build] 触发 build.py::pre_build():
+      #      用内嵌 kicad 的 proto 生成 kipy pb2/pyi,并以 git describe 写 kicad_api_version.py
+      # CI 等价实现:内嵌 kicad 直接 clone baidxi fork 的 master(维护者自编译 KiCad,
+      # 持续跟进 master,gitlink 指针可能滞后,故不按旧指针检出),再调用同一构建脚本。
+      - name: "Init kicad sources (dist.sh step 1: submodule init)"
+        run: git clone https://github.com/baidxi/kicad.git kicad-python/kicad
+
+      - name: "Generate kipy pb2/pyi + kicad_api_version.py (dist.sh step 2: poetry build hook)"
+        run: |
+          sudo apt-get update -q && sudo apt-get install -y -q protobuf-compiler
+          pip install "protobuf>=5.29,<6" "mypy-protobuf==3.6.0" protoletariat setuptools
+          cd kicad-python
+          python3 -c "import build; build.pre_build()"
+          # dist.sh 在构建后同样打印该文件供人工核对版本
+          echo "------ kicad_api_version.py ------"
+          cat kipy/kicad_api_version.py
+          echo "----------------------------------"
+
       - name: Build PCM package
         run: |
           echo "Package version: ${{ steps.ver.outputs.version }}"
@@ -60,8 +81,8 @@ jobs:
 
       - name: Validate package (kipy from submodule copy)
         run: |
+          # kicad_api_version.py 与 pb2/pyi 均已由上方 kicad-python 官方 pre_build 生成
           # cli 加载 kipy/__init__ 全链:一次性装齐 kipy 的全部运行时依赖
-          # (kicad-python 仓库的 pb2/pyi 已作为版本化资产入库,无需现场生成)
           pip install jsonschema "protobuf>=5.29,<6" pynng zstandard typing_extensions
           PYTHONPATH="$GITHUB_WORKSPACE/kicad-python" \
             python3 -m kipy.packaging.cli validate dist/*-pcm.zip
@@ -81,6 +102,11 @@ jobs:
           pb2 = zipfile.ZipFile(zips[0]).read(
               "plugins/lceda-kicad-plugin/kipy/proto/schematic/schematic_commands_pb2.py")
           assert b"interactive" in pb2, "bundled kipy 缺 interactive 扩展(应来自 baidxi fork)"
+          board_pb2 = zipfile.ZipFile(zips[0]).read(
+              "plugins/lceda-kicad-plugin/kipy/proto/board/board_types_pb2.py")
+          assert b"DrillChartAlign" in board_pb2, (
+              "bundled kipy 缺 DrillChartAlign:"
+              "baidxi/kicad master 的 proto 未包含该定义,请补入 fork 后重跑")
           print("package contents OK")
           EOF
 

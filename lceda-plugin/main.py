@@ -350,7 +350,8 @@ class PlaceWorker(QThread):
                 symbol_name = self.pipeline.ingest_symbol(
                     comp, footprint_ref=fp_ref)
 
-            self.log.emit(f"[2/4] 交互放置 {fp_ref}(元件跟随鼠标,左键落位,"
+            self.log.emit(f"[2/4] 交互放置 {self.pipeline.settings.library_nickname}:"
+                          f"{symbol_name}(元件跟随鼠标,左键落位,"
                           "可连续点击多放,Esc 结束)")
             self.bridge.place_symbol(symbol_name, {}, interactive=True)
             self.placed.emit(comp.title)
