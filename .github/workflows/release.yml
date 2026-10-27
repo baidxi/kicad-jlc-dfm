@@ -60,9 +60,9 @@ jobs:
 
       - name: Validate package (kipy from submodule copy)
         run: |
-          # cli 加载 kipy/__init__ 全链,需要 zstandard;
-          # kipy 的 pb2/pyi 已作为版本化资产入库,无需现场生成
-          pip install jsonschema "protobuf>=5.29,<6" zstandard
+          # cli 加载 kipy/__init__ 全链:一次性装齐 kipy 的全部运行时依赖
+          # (kicad-python 仓库的 pb2/pyi 已作为版本化资产入库,无需现场生成)
+          pip install jsonschema "protobuf>=5.29,<6" pynng zstandard typing_extensions
           PYTHONPATH="$GITHUB_WORKSPACE/kicad-python" \
             python3 -m kipy.packaging.cli validate dist/*-pcm.zip
 
