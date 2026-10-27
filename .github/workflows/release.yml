@@ -29,9 +29,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          # 递归同步:kicad 源码(baidxi/kicad fork,含 interactive 补丁)
-          # 是 kicad-python 的内嵌子模块,Generate 步骤需要它的 api/proto
-          submodules: recursive
+          submodules: true
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -55,19 +53,6 @@ jobs:
             echo "is_tag=false" >> "$GITHUB_OUTPUT"
           fi
 
-      # proto 单一来源 = baidxi/kicad(kicad-python 的内嵌子模块,含
-      # interactive 补丁)。submodules: recursive 递归检出后现场生成 pb2,
-      # 生成物不入库(官方做法)。
-      - name: Generate kipy protobuf wrappers
-        run: |
-          sudo apt-get update -q && sudo apt-get install -y -q protobuf-compiler
-          protoc --version
-          pip install "protobuf>=5.29,<6" "mypy-protobuf==3.6.0" protoletariat
-          PYTHONPATH="$GITHUB_WORKSPACE/kicad-python" \
-            python3 kicad-python/tools/generate_protos.py \
-            --input "$GITHUB_WORKSPACE/kicad-python/kicad/api/proto" \
-            --output "$GITHUB_WORKSPACE/kicad-python/kipy/proto"
-
       - name: Build PCM package
         run: |
           echo "Package version: ${{ steps.ver.outputs.version }}"
@@ -75,7 +60,8 @@ jobs:
 
       - name: Validate package (kipy from submodule copy)
         run: |
-          # cli 加载 kipy/__init__ 全链,需要 zstandard(protobuf 由 Generate 步骤装好)
+          # cli 加载 kipy/__init__ 全链,需要 zstandard;
+          # kipy 的 pb2/pyi 已作为版本化资产入库,无需现场生成
           pip install jsonschema "protobuf>=5.29,<6" zstandard
           PYTHONPATH="$GITHUB_WORKSPACE/kicad-python" \
             python3 -m kipy.packaging.cli validate dist/*-pcm.zip
