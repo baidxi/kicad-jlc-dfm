@@ -145,6 +145,10 @@ def build(version: str | None = None) -> Path:
     # 会在启动时用 venv 的 pip 安装它,而 Ubuntu 24.04 等缺 python3-venv 的
     # 系统上 venv 是残缺的(无 pip),安装失败会导致插件永不 ready、
     # 工具栏按钮不出现(死锁)。依赖改由入口脚本 pip.pyz 兜底安装。
+    # 副作用:官方 KiCad 会对"没有 requirements.txt"以 ERROR 上报,在 PCB
+    # 编辑器等重载插件时弹"无法读取 requirements.txt"(依赖流水线对所有
+    # Python 插件执行、与 scopes 无关)。本 fork 的 api_plugin_manager.cpp
+    # 已将其降级为 trace(kicad 子模块补丁);官方版上此提示无害,可忽略。
     for f in ("plugin.json", "icon.png", "lceda_plugin_entry.py", "README.md"):
         src = PLUGIN_SRC / f
         if src.exists():
