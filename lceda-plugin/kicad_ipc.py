@@ -305,18 +305,25 @@ class KicadBridge:
             return False
 
     def update_footprints(self, updates: dict[str, str],
-                          also_add_fields: dict[str, str] | None = None) -> int:
+                          also_add_fields: dict[str, str] | None = None,
+                          per_symbol_fields: dict[str, dict[str, str]] | None = None
+                          ) -> int:
         """按 internal_id(KIID 字符串)批量改 Footprint 字段,单次 commit;返回修改数。
 
-        also_add_fields:对每个被修改的 symbol 写入字段(如 Supplier/Supplier Part),不存在则新增。
+        also_add_fields:对所有被修改 symbol 写入相同字段(Supplier=LCSC 等)。
+        per_symbol_fields:{internal_id: {字段: 值}} — 逐元件字段(如各自的
+        Supplier Part 编号),优先级高于 also_add_fields。
         """
         sch = self._require_schematic()
         changed: list[Any] = []
         for s in sch.get_symbols():
-            if str(s.id) not in updates:
+            sid = str(s.id)
+            if sid not in updates:
                 continue
-            s.footprint_field.text.value = updates[str(s.id)]
+            s.footprint_field.text.value = updates[sid]
             for k, v in (also_add_fields or {}).items():
+                self._set_user_field(s, k, v)
+            for k, v in (per_symbol_fields or {}).get(sid, {}).items():
                 self._set_user_field(s, k, v)
             changed.append(s)
         if not changed:

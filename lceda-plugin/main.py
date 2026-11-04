@@ -15,19 +15,56 @@ import traceback
 from pathlib import Path
 from typing import Any
 
-# 优先使用工作区 kicad-python(含 interactive 扩展),先于 site-packages 旧版
+# kipy 运行时选择(先到先用,均做完整性校验):
+#   1. 工作区 kicad-python(含 interactive 扩展;仓库更新后可能缺 proto 生成文件,需校验)
+#   2. PCM 安装副本(插件管理器安装,含 interactive 扩展)
+#   3. 不注入 → site-packages 的 pip 安装版(可能无 interactive,自动降级直落)
 _APP_ROOT = Path(__file__).resolve().parent.parent
-_KICAD_PYTHON = _APP_ROOT / "kicad-python"
-if _KICAD_PYTHON.is_dir():
-    sys.path.insert(0, str(_KICAD_PYTHON))
+
+
+def _kipy_intact(base: Path) -> bool:
+    """kipy 副本是否完整(proto 生成文件齐备,可导入)。"""
+    return (base / "kipy" / "proto" / "common" / "envelope_pb2.py").exists()
+
+
+def _prepend_kipy_paths() -> None:
+    candidates: list[Path] = []
+    ws = _APP_ROOT / "kicad-python"
+    if _kipy_intact(ws):
+        candidates.append(ws)
+    else:
+        print(f"[kipy] 工作区副本不完整,跳过: {ws}", file=sys.stderr)
+
+    # PCM 安装副本:Linux/macOS 与 Windows 的 3rdparty 布局各扫一遍
+    import os  # noqa: PLC0415
+    roots = []
+    if os.name == "nt":
+        roots = [Path.home() / "AppData" / "Roaming" / "kicad"]
+    else:
+        roots = [Path.home() / ".local" / "share" / "kicad"]
+    for root in roots:
+        if not root.is_dir():
+            continue
+        for pcm in root.glob("*/3rdparty/plugins/*/lceda-kicad-plugin"):
+            if _kipy_intact(pcm):
+                candidates.append(pcm)
+                break
+
+    for c in candidates:
+        p = str(c)
+        if p not in sys.path:
+            sys.path.insert(0, p)
+
+
+_prepend_kipy_paths()
 
 from PySide6.QtCore import Qt, QThread, Signal
 from PySide6.QtGui import QPixmap
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import (
-    QApplication, QDialog, QHeaderView, QLabel, QLineEdit, QListWidget,
-    QMainWindow, QPushButton, QTableWidget, QTableWidgetItem, QTabWidget,
-    QTextEdit, QVBoxLayout, QHBoxLayout, QWidget, QMessageBox,
+    QApplication, QComboBox, QDialog, QHeaderView, QLabel, QLineEdit,
+    QListWidget, QMainWindow, QPushButton, QTableWidget, QTableWidgetItem,
+    QTabWidget, QTextEdit, QVBoxLayout, QHBoxLayout, QWidget, QMessageBox,
 )
 
 from .batch_footprint import BatchReport, BatchUpdater
@@ -332,16 +369,33 @@ class PlaceWorker(QThread):
         self.pipeline, self.bridge, self.comp = pipeline, bridge, comp
         self.position_mm = position_mm
 
+    def _ensure_builtin_set(self) -> None:
+        """懒加载已注册封装全集(IPC 在线时一次拉取,供内置优先匹配)。"""
+        if self.pipeline.builtin_footprints is not None:
+            return
+        try:
+            if self.bridge.connected:
+                self.pipeline.builtin_footprints = set(
+                    self.bridge.list_all_footprints())
+        except Exception:  # noqa: BLE001 - 拉取失败不阻塞,直接走立创回退
+            self.pipeline.builtin_footprints = None
+
     def run(self) -> None:
         comp = self.comp
         try:
             self.minimize_requested.emit()
+            self._ensure_builtin_set()
+            builtin_id, fp_src = self.pipeline.resolve_footprint(comp)
+
             symbol_name = self.pipeline.symbol_name(comp)
-            fp_name = self.pipeline.footprint_name(comp)
-            fp_ref = f"{self.pipeline.settings.library_nickname}:{fp_name}"
+            if builtin_id:
+                fp_ref = builtin_id          # KiCad 内置封装:自带 3D,零下载
+            else:
+                fp_name = self.pipeline.footprint_name(comp)
+                fp_ref = f"{self.pipeline.settings.library_nickname}:{fp_name}"
+
             if self.pipeline.symbol_in_lib(symbol_name):
                 # 本地优先:库中已有该符号则直接放置,不重复下载/写库
-                # (避免无谓的网络往返与读改写风险敞口)
                 self.log.emit(f"[1/4] 本地库已有 {symbol_name},跳过下载")
             else:
                 self.log.emit(f"[1/4] 下载符号 {comp.title}")
@@ -356,12 +410,16 @@ class PlaceWorker(QThread):
             self.bridge.place_symbol(symbol_name, {}, interactive=True)
             self.placed.emit(comp.title)
 
-            self.log.emit(f"[3/4] 后台:封装 {fp_name}")
-            self.pipeline.ingest_footprint(comp)
+            if builtin_id:
+                self.log.emit(f"[3/4] 封装:命中 KiCad 内置 {builtin_id}(跳过下载)")
+                self.log.emit("[4/4] 3D 模型:内置封装自带")
+            else:
+                self.log.emit(f"[3/4] 后台:封装 {fp_ref}")
+                self.pipeline.ingest_footprint(comp)
 
-            self.log.emit("[4/4] 后台:3D 模型")
-            step = self.pipeline.ingest_step(comp)
-            self.log.emit(f"完成(3D: {step.name if step else '元件未绘制模型'})")
+                self.log.emit("[4/4] 后台:3D 模型")
+                step = self.pipeline.ingest_step(comp)
+                self.log.emit(f"完成(3D: {step.name if step else '元件未绘制模型'})")
             self.log.emit("从任务栏恢复本窗口可继续放置下一个元件")
             self.finished_ok.emit()
         except Exception as ex:  # noqa: BLE001
@@ -391,14 +449,20 @@ class BatchWorker(QThread):
 
     def __init__(self, updater: BatchUpdater, mode: str, symbols: list[SymbolInfo],
                  comp: LcedaComponent | None = None,
-                 assignments: dict[str, str] | None = None) -> None:
+                 assignments: dict[str, str] | None = None,
+                 strategy: str | None = None) -> None:
         super().__init__()
         self.updater, self.mode = updater, mode
         self.symbols, self.comp, self.assignments = symbols, comp, assignments
+        self.strategy = strategy
 
     def run(self) -> None:
         try:
-            if self.mode == "online":
+            if self.mode == "auto":
+                self.done.emit(self.updater.auto_match(
+                    self.symbols, strategy=self.strategy,
+                    progress=lambda ref, step: self.progress.emit(ref, step)))
+            elif self.mode == "online":
                 self.done.emit(self.updater.update_online(
                     self.symbols,
                     progress=lambda ref, step: self.progress.emit(ref, step)))
@@ -557,12 +621,25 @@ class MainWindow(QMainWindow):
         v.addWidget(self._sym_table, 2)
 
         btns = QHBoxLayout()
+        b_auto = QPushButton("★ 自动匹配选中")
+        b_auto.clicked.connect(self.on_batch_auto)
+        self._strategy_box = QComboBox()
+        self._strategy_box.addItem("内置优先", "builtin_first")
+        self._strategy_box.addItem("立创优先", "lcsc_first")
+        self._strategy_box.addItem("仅内置(不下载)", "builtin_only")
+        # 恢复持久化的策略选择
+        idx = self._strategy_box.findData(self.settings.auto_match_strategy)
+        if idx >= 0:
+            self._strategy_box.setCurrentIndex(idx)
+        self._strategy_box.currentIndexChanged.connect(self._on_strategy_changed)
         b_online = QPushButton("A: 在线按 Supplier Part 更新选中")
         b_online.clicked.connect(self.on_batch_online)
         b_manual = QPushButton("B: 手动指定封装…")
         b_manual.clicked.connect(self.on_batch_manual)
         b_bind = QPushButton("C: 绑定为放置页选中元件")
         b_bind.clicked.connect(self.on_batch_bind)
+        btns.addWidget(b_auto)
+        btns.addWidget(self._strategy_box)
         for b in (b_online, b_manual, b_bind):
             btns.addWidget(b)
         v.addLayout(btns)
@@ -818,6 +895,45 @@ class MainWindow(QMainWindow):
         for ref, why in report.skipped:
             self._batch_log.append(f"[跳过] {ref}: {why}")
         self._batch_log.append(report.summary())
+
+    def _on_strategy_changed(self, index: int) -> None:
+        """策略下拉变化 → 持久化。"""
+        data = self._strategy_box.itemData(index)
+        if data:
+            self.settings.auto_match_strategy = data
+            self.settings.save()
+
+    def on_batch_auto(self) -> None:
+        """★ 自动匹配(批量):勾选了处理勾选行;未勾选处理全部元件。"""
+        symbols = self._selected_symbol_infos()
+        if not symbols:
+            # 未勾选 → 全量(排除电源/网标 #PWR 等)
+            symbols = [s for s in self._batch_symbols
+                       if not s.reference.startswith("#")]
+            if not symbols:
+                QMessageBox.information(self, "提示", "请先点「读取原理图元件」")
+                return
+            ans = QMessageBox.question(
+                self, "全量自动匹配",
+                f"未勾选任何行,将对全部 {len(symbols)} 个元件自动匹配。\n继续?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+            if ans != QMessageBox.StandardButton.Yes:
+                return
+        strategy = self._strategy_box.currentData() or "builtin_first"
+        no_pn = sum(1 for s in symbols if not (s.supplier_part or "").strip())
+        self._batch_log.append(
+            f"自动匹配 {len(symbols)} 个元件(策略:{self._strategy_box.currentText()},"
+            f"{no_pn} 个无编号将按值搜索)")
+        w = BatchWorker(self.updater, "auto", symbols, strategy=strategy)
+        w.progress.connect(lambda r, s: self._batch_log.append(f"[{r}] {s}"))
+        w.done.connect(self._on_auto_done)
+        w.failed.connect(lambda m: self._batch_log.append(f"[自动匹配失败] {m}"))
+        self._track(w)
+        w.start()
+
+    def _on_auto_done(self, report) -> None:
+        self._show_batch_report(report)
+        self.on_refresh_symbols()
 
     def on_batch_online(self) -> None:
         symbols = self._selected_symbol_infos()

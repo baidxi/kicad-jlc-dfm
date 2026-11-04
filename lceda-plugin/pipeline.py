@@ -38,6 +38,28 @@ class Pipeline:
         self._step_names: dict[str, str] = {}
         # 已确认在本地符号库中的符号名(放置本地优先,避免重复下载写库)
         self._known_symbols: set[str] = set()
+        # 已注册封装全集("lib:name" 字符串;由外部经 IPC 懒加载注入)。
+        # 非空时启用"内置封装优先":通用件命中 KiCad 官方库则跳过立创下载。
+        self.builtin_footprints: set[str] | None = None
+
+    # ── 封装决策:内置优先 ──
+
+    def resolve_footprint(self, comp: LcedaComponent) -> tuple[str | None, str]:
+        """决定该元件使用的封装。
+
+        返回 (lib_id, 来源):
+          ("Resistor_SMD:R_0603_1608Metric", "builtin") — 命中 KiCad 内置封装
+          (None, "lcsc")                                  — 回退立创下载
+        """
+        from . import builtin_map  # noqa: PLC0415
+
+        if not self.builtin_footprints:
+            return None, "lcsc"
+        context = f"{comp.title} {comp.description}"
+        cand = builtin_map.match(comp.footprint_title or "", context)
+        if cand and cand in self.builtin_footprints:
+            return cand, "builtin"
+        return None, "lcsc"
 
     # ── 命名 ──
 

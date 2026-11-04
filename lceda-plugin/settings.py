@@ -98,6 +98,9 @@ class Settings:
     """所有路径均可被 settings.json 覆盖;昵称同时用于库表注册与 Footprint 字段前缀。"""
 
     library_nickname: str = "lcsc"
+    # 自动匹配封装的优先策略:builtin_first(内置优先)| lcsc_first(立创优先)
+    # | builtin_only(仅内置,不下载)
+    auto_match_strategy: str = "builtin_first"
     # 库文件位置(None = 随 data_dir 默认)
     symbol_lib_file: str | None = None      # <...>/symbols/LCSC.kicad_sym
     footprint_lib_dir: str | None = None    # <...>/footprints/LCSC.pretty

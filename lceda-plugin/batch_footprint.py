@@ -34,6 +34,133 @@ class BatchUpdater:
         self.pipeline = pipeline
         self.bridge = bridge
 
+    # ── 封装决策:内置优先 ──
+
+    def _resolve(self, comp: LcedaComponent,
+                 progress=None, ref: str = "", strategy: str | None = None) -> str:
+        """封装决策(按策略):返回目标 Footprint 值("lib:name")。
+
+        strategy: builtin_first(默认)| lcsc_first | builtin_only
+        """
+        strategy = strategy or self.settings.auto_match_strategy or "builtin_first"
+
+        if strategy != "lcsc_first" and self.pipeline.builtin_footprints is None:
+            try:
+                if self.bridge.connected:
+                    self.pipeline.builtin_footprints = set(
+                        self.bridge.list_all_footprints())
+            except Exception:  # noqa: BLE001 - 拉取失败直接走立创回退
+                self.pipeline.builtin_footprints = None
+
+        if strategy in ("builtin_first", "builtin_only"):
+            builtin_id, _src = self.pipeline.resolve_footprint(comp)
+            if builtin_id:
+                if progress:
+                    progress(ref or comp.title, f"命中 KiCad 内置封装 {builtin_id}")
+                return builtin_id
+            if strategy == "builtin_only":
+                raise ValueError("无 KiCad 内置封装匹配(仅内置策略)")
+
+        if progress:
+            progress(ref or comp.title, "下载立创封装/3D")
+        fp_name = self.pipeline.ingest_footprint(comp)
+        self.pipeline.ingest_step(comp)
+        return f"{self.settings.library_nickname}:{fp_name}"
+
+    # ── 智能自动匹配 ──
+
+    def _best_by_value(self, value: str, current_fp: str) -> LcedaComponent | None:
+        """按元件值(如 100nF / AO3400 / 10k)搜索立创并挑最佳候选。
+
+        评分:编号精确 > 标题含关键词 > 封装尺寸码与现封装一致(保留原尺寸偏好)。
+        """
+        from . import builtin_map  # noqa: PLC0415
+
+        kw = (value or "").strip()
+        if not kw:
+            return None
+        results = self.client.smart_search(kw)
+        full = [c for c in results if c.symbol_uuid and c.footprint_uuid]
+        if not full:
+            return None
+        code = builtin_map._find_code((current_fp or "").upper())  # noqa: SLF001
+
+        def score(c: LcedaComponent) -> int:
+            s = 0
+            t = (c.title or "").lower()
+            pn = (c.part_number or "").lower()
+            if kw.lower() == pn:
+                s += 8
+            elif kw.lower() in t:
+                s += 4
+            if code and code in (c.footprint_title or "").upper():
+                s += 2
+            return s
+
+        full.sort(key=score, reverse=True)
+        return full[0]
+
+    def auto_match(self, symbols: list[SymbolInfo], strategy: str | None = None,
+                   progress=None) -> BatchReport:
+        """自动匹配封装(批量页「自动匹配」):
+
+        - 有 Supplier Part:按编号精确定位立创元件
+        - 无编号:按元件值搜索立创,智能挑最佳(编号/标题/封装尺寸码评分)
+        - 封装按策略决定(内置优先/立创优先/仅内置);无论内置或立创,
+          都回写 Supplier=LCSC 与 Supplier Part 编号
+        """
+        report = BatchReport()
+        prepared: dict[str, str] = {}
+        per_fields: dict[str, dict[str, str]] = {}
+        # 批量搜索缓存:同编号/同值+同封装码的元件(如几十个 100nF)只搜一次
+        cache: dict[str, LcedaComponent | None] = {}
+
+        for sym in symbols:
+            try:
+                comp: LcedaComponent | None = None
+                part = (sym.supplier_part or "").strip()
+                key = f"p:{part}" if part else \
+                    f"v:{sym.value}:{(sym.footprint or '')[-12:]}"
+                if key in cache:
+                    comp = cache[key]
+                elif part:
+                    comp = self.client.search_by_part_number(part)
+                    if comp is None and progress:
+                        progress(sym.reference, f"编号 {part} 未搜到,改按值搜索")
+                    cache[key] = comp
+                if comp is None and key not in cache:
+                    comp = self._best_by_value(sym.value, sym.footprint)
+                    cache[key] = comp
+                if comp is None:
+                    report.skipped.append((sym.reference, "编号与值均未匹配到元件"))
+                    continue
+
+                target = self._resolve(comp, progress=progress,
+                                       ref=sym.reference, strategy=strategy)
+                prepared[sym.internal_id] = target
+                fields = {"Supplier": "LCSC"}
+                pn = comp.clean_part_number()
+                if pn:
+                    fields["Supplier Part"] = pn
+                per_fields[sym.internal_id] = fields
+            except Exception as ex:  # noqa: BLE001 - 单个失败不阻塞批次
+                report.failed.append((sym.reference, str(ex)))
+
+        if not prepared:
+            return report
+        try:
+            n = self.bridge.update_footprints(prepared, per_symbol_fields=per_fields)
+            for sym in symbols:
+                if sym.internal_id in prepared:
+                    report.success.append((sym.reference, prepared[sym.internal_id]))
+            if n != len(prepared):
+                report.failed.append(("?", f"提交数 {n} != 计划数 {len(prepared)}"))
+        except Exception as ex:  # noqa: BLE001
+            for sym in symbols:
+                if sym.internal_id in prepared:
+                    report.failed.append((sym.reference, f"IPC 提交失败: {ex}"))
+        return report
+
     # ── 模式 A:在线按 Supplier Part ──
 
     def update_online(self, symbols: list[SymbolInfo],
@@ -54,12 +181,9 @@ class BatchUpdater:
                 if comp is None:
                     report.skipped.append((sym.reference, f"编号 {part} 未搜到元件"))
                     continue
-                if progress:
-                    progress(sym.reference, f"下载 {part} 封装/3D")
-                fp_name = self.pipeline.ingest_footprint(comp)
-                self.pipeline.ingest_step(comp)
+                target = self._resolve(comp, progress=progress, ref=sym.reference)
                 part_map[sym.internal_id] = comp.clean_part_number() or part
-                prepared[sym.internal_id] = f"{self.settings.library_nickname}:{fp_name}"
+                prepared[sym.internal_id] = target
             except Exception as ex:  # noqa: BLE001 - 单个失败不阻塞批次
                 report.failed.append((sym.reference, str(ex)))
 
@@ -107,11 +231,7 @@ class BatchUpdater:
         """把一个立创元件的封装/3D 绑定到若干原理图元件(含添加属性)。"""
         report = BatchReport()
         try:
-            if progress:
-                progress(comp.title, "下载封装/3D")
-            fp_name = self.pipeline.ingest_footprint(comp)
-            self.pipeline.ingest_step(comp)
-            target_fp = f"{self.settings.library_nickname}:{fp_name}"
+            target_fp = self._resolve(comp, progress=progress)
             prepared = {s.internal_id: target_fp for s in symbols}
             add_fields = {"Supplier": "LCSC"}
             pn = comp.clean_part_number()

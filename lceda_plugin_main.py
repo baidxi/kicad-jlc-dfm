@@ -18,10 +18,8 @@ if _PKG_DIR.is_dir() and "lceda_plugin" not in sys.modules:
     pkg.__version__ = "0.1.0"
     sys.modules["lceda_plugin"] = pkg
 
-# 工作区 kicad-python(interactive 扩展)优先于 site-packages 旧版
-_KICAD_PYTHON = _ROOT / "kicad-python"
-if _KICAD_PYTHON.is_dir():
-    sys.path.insert(0, str(_KICAD_PYTHON))
+# kipy 运行时选择交由 lceda_plugin.main 顶部的 _prepend_kipy_paths() 统一处理
+# (工作区副本完整性校验 + PCM 安装副本回退),此处不再无条件注入残缺路径。
 
 from lceda_plugin.main import main  # noqa: E402
 
