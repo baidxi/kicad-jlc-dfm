@@ -117,7 +117,7 @@ def _hole_drill(hole_json: Any) -> str:
     h = abs(_n(hole_json[2])) * _MIL_TO_MM if len(hole_json) > 2 else w
     if abs(w - h) < 1e-4:
         return f" (drill {_fmt(w)})"
-    return f" (drill (offset 0 0) (oval {_fmt(w)} {_fmt(h)}))"
+    return f" (drill oval {_fmt(w)} {_fmt(h)})"
 
 
 def _flat_points(pts: Any) -> tuple[list[float], list[float]]:
