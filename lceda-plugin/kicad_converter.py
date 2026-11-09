@@ -146,6 +146,56 @@ def _append_segments(body: list[str], pts: Any, layer: str, width: float) -> Non
             f'(stroke (width {_fmt(width)}) (type solid)) (layer "{layer}"))\n')
 
 
+def _append_circle(body: list[str], cx_mil: float, cy_mil: float, r_mil: float,
+                   layer: str, width: float, filled: bool = False) -> None:
+    cx, cy, r = cx_mil * _MIL_TO_MM, cy_mil * _MIL_TO_MM, r_mil * _MIL_TO_MM
+    fill = " solid" if filled else ""
+    body.append(
+        f'  (fp_circle (center {_fmt(cx)} {_fmt(cy)}) (end {_fmt(cx + r)} {_fmt(cy)}) '
+        f'(stroke (width {_fmt(width)}) (type solid)){fill} (layer "{layer}"))\n')
+
+
+def _append_rect(body: list[str], x_mil: float, y_mil: float, w_mil: float,
+                 h_mil: float, rot_deg: float, layer: str, width: float) -> None:
+    """EasyEDA 子形状 R(x,y 为左上角,w/h 宽高,rot 绕矩形中心)。"""
+    import math  # noqa: PLC0415
+    w, h = w_mil * _MIL_TO_MM, h_mil * _MIL_TO_MM
+    cx = (x_mil + w_mil / 2) * _MIL_TO_MM
+    cy = (y_mil - h_mil / 2) * _MIL_TO_MM      # y 翻转后的中心
+    rad = math.radians(rot_deg)
+    corners = []
+    for dx, dy in ((-w / 2, -h / 2), (w / 2, -h / 2), (w / 2, h / 2), (-w / 2, h / 2)):
+        corners.append((cx + dx * math.cos(rad) - dy * math.sin(rad),
+                        cy + dx * math.sin(rad) + dy * math.cos(rad)))
+    pts = corners + [corners[0]]
+    for i in range(4):
+        body.append(
+            f'  (fp_line (start {_fmt(pts[i][0])} {_fmt(pts[i][1])}) '
+            f'(end {_fmt(pts[i + 1][0])} {_fmt(pts[i + 1][1])}) '
+            f'(stroke (width {_fmt(width)}) (type solid)) (layer "{layer}"))\n')
+
+
+def _poly_shapes(body: list[str], pts: Any, layer: str, width: float) -> None:
+    """POLY 点集分发:子形状指令(R/CIRCLE/A)或扁平点集折线。
+
+    EasyEDA 常把丝印框(R)、pin1 标记(CIRCLE)作为子形状嵌在 POLY 里,
+    按点集解析会画成错位线段(表现为杂散长线 + 框/标记丢失)。
+    """
+    if not isinstance(pts, list) or not pts:
+        return
+    head = pts[0]
+    if isinstance(head, str):
+        if head == "CIRCLE" and len(pts) >= 4:
+            _append_circle(body, _n(pts[1]), _n(pts[2]), _n(pts[3]), layer, width)
+        elif head == "R" and len(pts) >= 5:
+            rot = _n(pts[5]) if len(pts) > 5 else 0.0
+            _append_rect(body, _n(pts[1]), _n(pts[2]), _n(pts[3]),
+                         abs(_n(pts[4])), rot, layer, width)
+        # "A"(弧)暂不支持,忽略比画错线安全
+        return
+    _append_segments(body, pts, layer, width)
+
+
 def _append_fill_poly(body: list[str], pts: Any, layer: str) -> None:
     xs, ys = _flat_points(pts)
     if len(xs) < 3:
@@ -203,6 +253,13 @@ def convert_footprint(doc: str, name: str, description: str | None = None,
             k_shape, w, h = _pad_shape(shape)
             if w <= 0:
                 w = h = 1.6
+            # EasyEDA 对 90°/270° pad 的 shape 宽高已按最终朝向给出,
+            # 而 KiCad 的 (size w h) 是"未旋转尺寸"+ rot 旋转 —— 奇数倍
+            # 90° 时必须交换,否则 pad 宽于 pitch,上下两排相邻焊盘
+            # 重叠连成一条(用户可见的"pin 全成一排"现象)。
+            rot = _n(a[14])
+            if abs(rot % 180 - 90) < 0.001:
+                w, h = h, w
 
             if tht:
                 k_type, layers = "thru_hole", '"*.Cu" "*.Mask"'
@@ -220,14 +277,26 @@ def convert_footprint(doc: str, name: str, description: str | None = None,
                 f"(at {_fmt(x)} {_fmt(y)}{rot_part}) "
                 f"(size {_fmt(abs(w))} {_fmt(abs(h))}){drill} "
                 f"(layers {layers}))\n")
+        elif op == "VIA" and len(a) > 8:
+            # EasyEDA VIA(常见于 EP 散热盘接地孔阵列):
+            # a[5]=x a[6]=y a[7]=钻孔 a[8]=孔环外径(mil)→ 转无编号通孔 pad
+            x, y = _n(a[5]) * _MIL_TO_MM, _n(a[6]) * _MIL_TO_MM
+            drill = max(abs(_n(a[7])) * _MIL_TO_MM, 0.1)
+            dia = max(abs(_n(a[8])) * _MIL_TO_MM, drill + 0.2)
+            body.append(
+                f'  (pad "" thru_hole circle (at {_fmt(x)} {_fmt(y)}) '
+                f"(size {_fmt(dia)} {_fmt(dia)}) (drill {_fmt(drill)}) "
+                f'(layers "*.Cu" "*.Mask")\n  )\n')
         elif op == "POLY" and len(a) > 6:
             layer = _LAYER_MAP.get(int(_n(a[4])), "F.SilkS")
             width = max(_n(a[5]) * _MIL_TO_MM, 0.05)
-            _append_segments(body, a[6], layer, width)
+            _poly_shapes(body, a[6], layer, width)
         elif op == "FILL" and len(a) > 7:
             layer_id = int(_n(a[4]))
-            if layer_id == 49:
-                continue  # 3D 标记层
+            if layer_id in (5, 6, 7, 8):
+                continue  # mask/paste 开窗:pad 定义自带,独立多边形冗余
+            if layer_id in (49, 50):
+                continue  # 3D 标记层(49 实体/50 逐焊盘标记),非图形
             k_layer = {5: "F.Mask", 6: "B.Mask", 7: "F.Paste", 8: "B.Paste",
                        9: "F.Fab", 10: "B.Fab", 11: "Edge.Cuts",
                        13: "User.Drawings"}.get(layer_id, "F.Fab")
@@ -284,6 +353,83 @@ def inject_model(fp_text: str, model_ref: str) -> str:
 
 # ── 符号 ──
 
+def _collect_pin_meta(insts: list[list[Any]]) -> dict[str, dict[str, str]]:
+    """扫描全部指令,收集引脚元数据(pin id → {NAME/NUMBER/Pin Type})。
+
+    两遍扫描的第一遍:EasyEDA 中 ATTR 与 PIN 的相对顺序不保证
+    (多单元 PART 段内通常 ATTR 先于 PIN,但不依赖该顺序)。
+    """
+    pin_ids = {_s(a[1]) for a in insts if _s(a[0]) == "PIN" and len(a) > 1}
+    meta: dict[str, dict[str, str]] = {}
+    for a in insts:
+        if _s(a[0]) != "ATTR" or len(a) <= 4:
+            continue
+        parent, key, val = _s(a[2]), _s(a[3]), _s(a[4])
+        if parent in pin_ids:
+            meta.setdefault(parent, {})[key] = val
+    return meta
+
+
+def _sym_unit_body(a: list[Any], pin_meta: dict[str, dict[str, str]],
+                   graphics: list[str], pins: list[str]) -> None:
+    """单条图形/引脚指令 → KiCad 文本(追加进 graphics/pins)。"""
+    op = _s(a[0])
+    if op == "RECT" and len(a) > 5:
+        x1, y1 = _n(a[2]) * _SYM_UNIT_TO_MM, -_n(a[3]) * _SYM_UNIT_TO_MM
+        x2, y2 = _n(a[4]) * _SYM_UNIT_TO_MM, -_n(a[5]) * _SYM_UNIT_TO_MM
+        graphics.append(
+            f"    (rectangle (start {_fmt(x1)} {_fmt(y1)}) (end {_fmt(x2)} {_fmt(y2)}) "
+            f"(stroke (width 0.254) (type default)) (fill (type none)))\n")
+    elif op == "CIRCLE" and len(a) > 4:
+        cx, cy = _n(a[2]) * _SYM_UNIT_TO_MM, -_n(a[3]) * _SYM_UNIT_TO_MM
+        r = _n(a[4]) * _SYM_UNIT_TO_MM
+        # KiCad 原理图符号 circle 用 (radius N);与 PCB fp_circle 的
+        # (end x y) 不同,用 (end) 会令官方解析器整库加载失败。
+        graphics.append(
+            f"    (circle (center {_fmt(cx)} {_fmt(cy)}) (radius {_fmt(r)}) "
+            f"(stroke (width 0.254) (type default)) (fill (type none)))\n")
+    elif op == "ELLIPSE" and len(a) > 4:
+        # EasyEDA ELLIPSE:x y rx ry —— KiCad circle 以半径表达(椭圆不支持,取 rx)
+        cx, cy = _n(a[2]) * _SYM_UNIT_TO_MM, -_n(a[3]) * _SYM_UNIT_TO_MM
+        r = _n(a[4]) * _SYM_UNIT_TO_MM
+        graphics.append(
+            f"    (circle (center {_fmt(cx)} {_fmt(cy)}) (radius {_fmt(r)}) "
+            f"(stroke (width 0.254) (type default)) (fill (type none)))\n")
+    elif op == "POLY":
+        pts = a[2] if len(a) > 2 else None
+        if not isinstance(pts, list):
+            return
+        filled = (len(a) >= 6 and abs(_n(a[-1]) - 1) < 0.001)
+        xs, ys = [], []
+        i = 0
+        while i + 1 < len(pts):
+            if isinstance(pts[i], (int, float)) and isinstance(pts[i + 1], (int, float)):
+                xs.append(_n(pts[i]) * _SYM_UNIT_TO_MM)
+                ys.append(-_n(pts[i + 1]) * _SYM_UNIT_TO_MM)
+                i += 2
+            else:
+                i += 1
+        if len(xs) < 2:
+            return
+        pts_txt = " ".join(f"(xy {_fmt(x)} {_fmt(y)})" for x, y in zip(xs, ys))
+        graphics.append(
+            f"    (polyline (pts {pts_txt}) (stroke (width 0.254) (type default)) "
+            f'(fill (type {"background" if filled else "none"})))\n')
+    elif op == "PIN" and len(a) > 7:
+        pid = _s(a[1])
+        m = pin_meta.get(pid, {})
+        x, y = _n(a[4]) * _SYM_UNIT_TO_MM, -_n(a[5]) * _SYM_UNIT_TO_MM
+        length = _n(a[6]) * _SYM_UNIT_TO_MM
+        rot = _n(a[7])
+        etype = _pin_elec_type(m.get("Pin Type"))
+        pname = m.get("NAME", "")
+        pnum = m.get("NUMBER", "")
+        pins.append(
+            f"    (pin {etype} line (at {_fmt(x)} {_fmt(y)} {_fmt(rot)}) "
+            f"(length {_fmt(length)}) (name {_esc(pname or '~')}) "
+            f"(number {_esc(pnum or '~')}))\n")
+
+
 def convert_symbol(doc: str, name: str, value: str | None = None,
                    designator: str | None = None,
                    footprint: str | None = None,
@@ -292,69 +438,32 @@ def convert_symbol(doc: str, name: str, value: str | None = None,
     """符号文档 → .kicad_sym 文本;footprint/supplier/supplier_part 非空时库级预置属性。
 
     footprint 预置(如 "LCSC:SOT-23-3")使交互式放置出来的元件自动带正确封装引用。
+    多单元(PART 分段,如 RK3566 的 8 单元)→ 每 unit 一个
+    ``NAME_<u>_1`` 子符号;单单元 → ``NAME_0_1`` 共享体(与 KiCad 库
+    规范一致:0 = 全 unit 共享,1..N = 各 unit 独立体)。
     """
-    graphics: list[str] = []
-    pins: list[str] = []
-    pin_names: dict[str, str] = {}
-    pin_numbers: dict[str, str] = {}
-    pin_types: dict[str, str] = {}
+    insts = list(parse_instructions(doc))
+    pin_meta = _collect_pin_meta(insts)
 
-    for a in parse_instructions(doc):
+    # 按 PART 分段:段内图形/引脚归属对应 unit;无 PART 时整体为单 unit
+    units: list[tuple[list[str], list[str]]] = []
+    cur_g: list[str] = []
+    cur_p: list[str] = []
+    for a in insts:
         op = _s(a[0])
-        if op == "RECT" and len(a) > 5:
-            x1, y1 = _n(a[2]) * _SYM_UNIT_TO_MM, -_n(a[3]) * _SYM_UNIT_TO_MM
-            x2, y2 = _n(a[4]) * _SYM_UNIT_TO_MM, -_n(a[5]) * _SYM_UNIT_TO_MM
-            graphics.append(
-                f"    (rectangle (start {_fmt(x1)} {_fmt(y1)}) (end {_fmt(x2)} {_fmt(y2)}) "
-                f"(stroke (width 0.254) (type default)) (fill (type none)))\n")
-        elif op == "CIRCLE" and len(a) > 4:
-            cx, cy = _n(a[2]) * _SYM_UNIT_TO_MM, -_n(a[3]) * _SYM_UNIT_TO_MM
-            r = _n(a[4]) * _SYM_UNIT_TO_MM
-            graphics.append(
-                f"    (circle (center {_fmt(cx)} {_fmt(cy)}) (end {_fmt(cx + r)} {_fmt(cy)}) "
-                f"(stroke (width 0.254) (type default)) (fill (type none)))\n")
-        elif op == "POLY":
-            pts = a[2] if len(a) > 2 else None
-            if not isinstance(pts, list):
-                continue
-            filled = (len(a) >= 6 and abs(_n(a[-1]) - 1) < 0.001)
-            xs, ys = [], []
-            i = 0
-            while i + 1 < len(pts):
-                if isinstance(pts[i], (int, float)) and isinstance(pts[i + 1], (int, float)):
-                    xs.append(_n(pts[i]) * _SYM_UNIT_TO_MM)
-                    ys.append(-_n(pts[i + 1]) * _SYM_UNIT_TO_MM)
-                    i += 2
-                else:
-                    i += 1
-            if len(xs) < 2:
-                continue
-            pts_txt = " ".join(f"(xy {_fmt(x)} {_fmt(y)})" for x, y in zip(xs, ys))
-            graphics.append(
-                f"    (polyline (pts {pts_txt}) (stroke (width 0.254) (type default)) "
-                f'(fill (type {"background" if filled else "none"})))\n')
-        elif op == "PIN" and len(a) > 7:
-            pid = _s(a[1])
-            x, y = _n(a[4]) * _SYM_UNIT_TO_MM, -_n(a[5]) * _SYM_UNIT_TO_MM
-            length = _n(a[6]) * _SYM_UNIT_TO_MM
-            rot = _n(a[7])
-            etype = _pin_elec_type(pin_types.get(pid))
-            pname = pin_names.get(pid, "")
-            pnum = pin_numbers.get(pid, "")
-            pins.append(
-                f"    (pin {etype} line (at {_fmt(x)} {_fmt(y)} {_fmt(rot)}) "
-                f"(length {_fmt(length)}) (name {_esc(pname or '~')}) "
-                f"(number {_esc(pnum or '~')}))\n")
-        elif op == "ATTR" and len(a) > 4:
-            parent, key, val = _s(a[2]), _s(a[3]), _s(a[4])
-            if not parent:
-                continue  # 全局属性由入参决定
-            if key == "NAME":
-                pin_names[parent] = val
-            elif key == "NUMBER":
-                pin_numbers[parent] = val
-            elif key == "Pin Type":
-                pin_types[parent] = val
+        if op == "PART":
+            if cur_g or cur_p or units:
+                units.append((cur_g, cur_p))
+            cur_g, cur_p = [], []
+            continue
+        if op in ("RECT", "CIRCLE", "ELLIPSE", "POLY", "PIN"):
+            _sym_unit_body(a, pin_meta, cur_g, cur_p)
+    if cur_g or cur_p or not units:
+        units.append((cur_g, cur_p))
+    # PART 出现但首段为空(段头之前只有全局指令)时剔除空段
+    units = [(g, p) for g, p in units if g or p]
+
+    multi = len(units) > 1
 
     props: list[str] = []
     props.append(f'\t\t(property "Reference" {_esc(designator or "U")}'
@@ -381,12 +490,14 @@ def convert_symbol(doc: str, name: str, value: str | None = None,
     out.append(f"\t(symbol {_esc(name)}\n")
     out.append("\t\t(exclude_from_sim no)\n\t\t(in_bom yes)\n\t\t(on_board yes)\n")
     out.extend(props)
-    out.append(f"\t\t(symbol {_esc(name + '_0_1')}\n")
-    out.extend(graphics)
-    out.extend(pins)
-    out.append("\t\t)\n\t)\n)\n")
+    for u, (graphics, pins) in enumerate(units, start=0 if not multi else 1):
+        sub = f"{name}_{u}_1" if multi else f"{name}_0_1"
+        out.append(f"\t\t(symbol {_esc(sub)}\n")
+        out.extend(graphics)
+        out.extend(pins)
+        out.append("\t\t)\n")
+    out.append("\t)\n)\n")
     return "".join(out)
-
 
 def extract_symbol_block(lib_text: str) -> str:
     """从完整 .kicad_sym 文本中提取首个 (symbol ...) 块(供追加进共享库)。
