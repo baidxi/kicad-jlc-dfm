@@ -69,17 +69,22 @@ class KicadBridge:
 
     @staticmethod
     def _retry(fn, attempts: int = 6, delay: float = 0.8):
-        """KiCad 忙时(用户正在交互/撤销等)API 返回 busy 错误,等待重试。"""
+        """KiCad 忙/慢时等待重试(busy 错误或连接超时)。"""
         import time  # noqa: PLC0415
         for i in range(attempts):
             try:
                 return fn()
             except Exception as ex:  # noqa: BLE001
-                busy = "busy" in str(ex).lower()
-                if not busy or i == attempts - 1:
-                    if busy:
+                low = str(ex).lower()
+                busy = "busy" in low
+                # 连接超时与 busy 同源:KiCad 端被交互工具占用或处理慢。
+                # 上一次交互放置尚未结束时就发新命令,超时是典型现象。
+                timeout = "timed out" in low or "timeout" in low
+                slow = busy or timeout
+                if not slow or i == attempts - 1:
+                    if slow:
                         raise KiCadBusyError(
-                            "KiCad 持续忙(重试约 5 秒无果)。常见原因:"
+                            "KiCad 持续忙/响应超时(重试无果)。常见原因:"
                             "①交互放置模式仍在进行——在 KiCad 中按 Esc 结束;"
                             "②有对话框/编辑工具未关闭。稍候再试。") from ex
                     raise
@@ -98,7 +103,10 @@ class KicadBridge:
 
             _diag(f"kipy 运行时路径: {kipy.__file__}")   # 排查混装(venv vs bundled)
             from kipy.kicad import KiCad  # 延迟导入:未装 kipy 时其余功能不受影响
-            self._kicad = KiCad()
+            # 默认 2 秒超时太短:KiCad 端 handler 在交互工具运行中会排队,
+            # 库刚重载时也偏慢,超时会以 ConnectionError: Timed out 形式
+            # 冒给用户。放宽到 10 秒(官方文档建议交互场景加大超时)。
+            self._kicad = KiCad(timeout_ms=10000)
             self._kicad.get_version()  # 探活
             self._schematic = self._kicad.get_schematic()
             return True
@@ -190,11 +198,24 @@ class KicadBridge:
             _diag("KiCad/kipy 不支持 interactive 放置,降级为程序化直落")
 
         def _place() -> Any:
+            if supports:
+                return sch.place_symbol_from_library(
+                    lib_id, Vector2.from_xy_mm(position_mm[0], position_mm[1]),
+                    interactive=interactive)
+            # kipy 版本不支持 interactive:关键字参数不能传(传 False 也会
+            # 抛 TypeError "unexpected keyword argument",官方 pip 版即此现象)。
             return sch.place_symbol_from_library(
-                lib_id, Vector2.from_xy_mm(position_mm[0], position_mm[1]),
-                interactive=interactive)
+                lib_id, Vector2.from_xy_mm(position_mm[0], position_mm[1]))
 
         try:
+            instance = self._retry(_place)
+        except TypeError as ex:
+            # 防御:能力检测误判(混装环境签名与实现不一致)时兜底降级重试。
+            if "keyword argument" not in str(ex):
+                raise
+            _diag(f"interactive 关键字参数被拒绝,降级直落重试: {ex}")
+            supports = False
+            interactive = False
             instance = self._retry(_place)
         except Exception as ex:  # noqa: BLE001
             low = str(ex).lower()
