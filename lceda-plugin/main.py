@@ -50,7 +50,8 @@ def _prepend_kipy_paths() -> None:
                 candidates.append(pcm)
                 break
 
-    for c in candidates:
+    # 倒序插入:优先级最高的(先入 candidates)最终位于 sys.path 最前
+    for c in reversed(candidates):
         p = str(c)
         if p not in sys.path:
             sys.path.insert(0, p)
@@ -318,6 +319,25 @@ class PreviewWorker(QThread):
             self.failed.emit(_fmt_err(ex))
 
 
+class FocusWorker(QThread):
+    """后台执行选中+聚焦联动;done 回传 (ref, 选中结果, 聚焦结果)。"""
+
+    done = Signal(str, bool, bool)
+
+    def __init__(self, bridge: KicadBridge, info: SymbolInfo) -> None:
+        super().__init__()
+        self.bridge, self.info = bridge, info
+
+    def run(self) -> None:
+        sel = foc = False
+        try:
+            sel = self.bridge.select_symbol(self.info.internal_id)
+            foc = self.bridge.focus_symbol(self.info.internal_id)
+        except Exception:  # noqa: BLE001 - 联动失败静默,经 done 上报
+            pass
+        self.done.emit(self.info.reference, sel, foc)
+
+
 class QuietWorker(QThread):
     """后台跑任意无返回值函数;异常静默(选中联动等轻量任务)。
 
@@ -489,7 +509,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         import time  # noqa: PLC0415
         self.setWindowTitle(f"立创元件 → KiCad (IPC)  ·  {time.strftime('%H:%M:%S')} 启动")
-        self.resize(1000, 660)
+        self.resize(860, 600)
 
         self.settings = Settings.load()
         self.client = LcedaClient()
@@ -819,11 +839,14 @@ class MainWindow(QMainWindow):
             return
         info = infos[0]
 
-        def _link() -> None:
-            self.bridge.select_symbol(info.internal_id)
-            self.bridge.focus_symbol(info.internal_id)
-
-        self._track(QuietWorker(_link))
+        w = FocusWorker(self.bridge, info)
+        w.done.connect(
+            lambda ref, sel, foc: self._batch_log.append(
+                f"[联动] {ref}:选中{'✓' if sel else '✗'} "
+                f"聚焦{'✓' if foc else '✗'}"
+                + ("" if (sel and foc) else "(KiCad 忙?稍后重试点该行)")))
+        self._track(w)
+        w.start()
 
     def on_refresh_symbols(self) -> None:
         w = ListSymbolsWorker(self.bridge)

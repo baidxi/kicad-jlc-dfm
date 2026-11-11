@@ -269,8 +269,13 @@ class KicadBridge:
             ))
         return out
 
-    def focus_symbol(self, internal_id: str) -> bool:
-        """让 KiCad 视图聚焦(切换 sheet + 缩放居中)到指定元件。"""
+    def focus_symbol(self, internal_id: str, keep_zoom: bool = True) -> bool:
+        """让 KiCad 视图聚焦(切换 sheet + 居中)到指定元件。
+
+        keep_zoom=True:仅把视图平移到元件居中,不改变当前缩放级别
+        (需 KiCad 含 FocusOnItems.keep_zoom 扩展;旧 KiCad 忽略该字段,
+        仍按 ZoomFitBox 缩放适配)。
+        """
         import re  # noqa: PLC0415
 
         sch = self._require_schematic()
@@ -288,6 +293,10 @@ class KicadBridge:
             cmd.document.CopyFrom(sch._doc)          # noqa: SLF001 - kipy 未封装
             item = cmd.items.add()
             item.value = uuid
+            try:
+                cmd.keep_zoom = keep_zoom     # 扩展字段:旧 pb2 无此字段则忽略
+            except AttributeError:
+                pass
             self._kicad._client.send(cmd, Empty)     # noqa: SLF001 - FocusOnItems 未封装
             return True
 
