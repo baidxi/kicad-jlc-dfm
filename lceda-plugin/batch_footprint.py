@@ -44,13 +44,11 @@ class BatchUpdater:
         """
         strategy = strategy or self.settings.auto_match_strategy or "builtin_first"
 
-        if strategy != "lcsc_first" and self.pipeline.builtin_footprints is None:
-            try:
-                if self.bridge.connected:
-                    self.pipeline.builtin_footprints = set(
-                        self.bridge.list_all_footprints())
-            except Exception:  # noqa: BLE001 - 拉取失败直接走立创回退
-                self.pipeline.builtin_footprints = None
+        if strategy != "lcsc_first" \
+                and not self.pipeline.ensure_builtin_set(self.bridge):
+            if progress:
+                progress(ref or comp.title,
+                         "内置封装列表不可用(KiCad 忙或未连接),本次按立创处理")
 
         if strategy in ("builtin_first", "builtin_only"):
             builtin_id, _src = self.pipeline.resolve_footprint(comp)

@@ -34,16 +34,24 @@ _CHIP_METRIC = {
     "1825": "4564Metric",
     "2010": "5025Metric",
     "2512": "6332Metric",
+    "1008": "2520Metric",   # 一体成型电感常用码
+}
+
+# 电感无通用 Metric 名的码 → 官方厂商专用封装(全集验证兜底)
+_EXTRA_L = {
+    "0806": "Inductor_SMD:L_Murata_DFE201610P",   # 2.0x1.6mm(如 C161082 DFE201610E)
 }
 
 # 片式前缀 → KiCad 库
 _CHIP_LIB = {"R": "Resistor_SMD", "C": "Capacitor_SMD", "L": "Inductor_SMD"}
 
 # 类别词(中/英,小写子串匹配)→ 片式前缀
+# 注:官方库无 Ferrite_SMD 封装库,SMD 磁珠(F0805 等)归入 Inductor_SMD 无对应,
+# 由全集验证自然回退立创;此处类别词仅用于给"无前缀尺寸码"补前缀。
 _CATEGORY_WORDS = [
     (("电阻", "resistor"), "R"),
     (("电容", "capacitor"), "C"),
-    (("电感", "磁珠", "inductor", "ferrite"), "L"),
+    (("电感", "磁珠", "inductor", "ferrite", "bead"), "L"),
 ]
 
 # SOT/SOD 形态 → KiCad 官方 lib_id(长键优先,避免 SOT-23 命中 SOT-23-5)
@@ -61,6 +69,11 @@ _TO_SOT = {
     "SOD-523":  "Package_TO_SOT_SMD:SOD-523",
     "SOD-723":  "Package_TO_SOT_SMD:SOD-723",
     "SOD-923":  "Package_TO_SOT_SMD:SOD-923",
+    # SC-70 家族(立创常用名;SC-70-x = SOT-36x/-35x/-34x/-323)
+    "SC-70-6":  "Package_TO_SOT_SMD:SOT-363_SC-70-6",
+    "SC-70-5":  "Package_TO_SOT_SMD:SOT-353_SC-70-5",
+    "SC-70-4":  "Package_TO_SOT_SMD:SOT-343_SC-70-4",
+    "SC-70":    "Package_TO_SOT_SMD:SOT-323_SC-70",
 }
 _TO_SOT_KEYS = sorted(_TO_SOT, key=len, reverse=True)
 
@@ -114,6 +127,8 @@ def match(footprint_title: str, context: str = "") -> str | None:
         metric = _CHIP_METRIC.get(code)
         if metric:
             return f"{_CHIP_LIB[prefix]}:{prefix}_{code}_{metric}"
+        if prefix == "L" and code in _EXTRA_L:
+            return _EXTRA_L[code]      # 无 Metric 名的电感码 → 厂商专用封装
 
     # 3) 无标准前缀:尺寸码(形态段优先,全文兜底)+ 类别词补前缀
     code = _find_code(head) or _find_code(title)

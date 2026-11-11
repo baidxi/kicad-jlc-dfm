@@ -118,15 +118,21 @@ def _fmt_err(ex: Exception) -> str:
 
 
 class ReplaceSearchDialog(QDialog):
-    """行内「搜索替换」对话框:在线搜索立创元件,选中后返回给调用方绑定。"""
+    """行内「搜索替换」对话框:在线搜索立创元件,选中后返回给调用方绑定。
+
+    结果表含「使用量」列:当前原理图中已选用该立创编号(C 编号)的元件数。
+    """
 
     def __init__(self, client: LcedaClient, reference: str, current_value: str,
+                 usage_counts: dict[str, int] | None = None,
                  parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setWindowTitle(f"搜索替换 — {reference}({current_value})")
-        self.resize(860, 520)
+        self.resize(920, 520)
         self.client = client
         self.selected: LcedaComponent | None = None
+        # {C 编号: 已选用数} — 由主窗口从当前原理图统计传入
+        self.usage = {k.upper(): v for k, v in (usage_counts or {}).items()}
 
         v = QVBoxLayout(self)
         row = QHBoxLayout()
@@ -139,11 +145,12 @@ class ReplaceSearchDialog(QDialog):
         row.addWidget(btn)
         v.addLayout(row)
 
-        self._table = QTableWidget(0, 3)
-        self._table.setHorizontalHeaderLabels(["元件", "编号", "封装"])
+        self._table = QTableWidget(0, 4)
+        self._table.setHorizontalHeaderLabels(["元件", "编号", "封装", "使用量"])
         header = self._table.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.Stretch)
         header.setSectionResizeMode(2, QHeaderView.Stretch)
+        header.setSectionResizeMode(3, QHeaderView.ResizeToContents)
         self._table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self._table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
         self._table.doubleClicked.connect(lambda _: self.accept_selection())
@@ -229,10 +236,17 @@ class ReplaceSearchDialog(QDialog):
                 continue  # 缺符号/封装的条目无法完成替换
             r = self._table.rowCount()
             self._table.insertRow(r)
+            pn = (c.part_number or "").upper()
+            n_used = self.usage.get(pn, 0) if pn else 0
             for col, val in enumerate([c.title, c.part_number or "—",
-                                       c.footprint_title or "—"]):
+                                       c.footprint_title or "—",
+                                       str(n_used) if n_used else "—"]):
                 item = QTableWidgetItem(val)
                 item.setData(Qt.ItemDataRole.UserRole, c)
+                if col == 3:
+                    item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                    if n_used >= 5:
+                        item.setForeground(Qt.GlobalColor.darkGreen)
                 self._table.setItem(r, col, item)
         if not results:
             QMessageBox.information(self, "无结果", f"未搜到「{kw}」")
@@ -390,15 +404,8 @@ class PlaceWorker(QThread):
         self.position_mm = position_mm
 
     def _ensure_builtin_set(self) -> None:
-        """懒加载已注册封装全集(IPC 在线时一次拉取,供内置优先匹配)。"""
-        if self.pipeline.builtin_footprints is not None:
-            return
-        try:
-            if self.bridge.connected:
-                self.pipeline.builtin_footprints = set(
-                    self.bridge.list_all_footprints())
-        except Exception:  # noqa: BLE001 - 拉取失败不阻塞,直接走立创回退
-            self.pipeline.builtin_footprints = None
+        """内置封装全集:内存 → 磁盘缓存 → IPC(见 Pipeline.ensure_builtin_set)。"""
+        self.pipeline.ensure_builtin_set(self.bridge)
 
     def run(self) -> None:
         comp = self.comp
@@ -888,9 +895,24 @@ class MainWindow(QMainWindow):
         if skipped:
             self._batch_log.append(f"已隐藏 {skipped} 个电源/网标;当前显示 {shown} 个")
 
+    def _usage_counts(self) -> dict[str, int]:
+        """统计当前原理图各立创编号(C 编号)的已选用数(供搜索替换展示)。
+
+        兼容脏格式('LCSC C9999 #备注' 等):用子串搜索提取 C 编号。
+        """
+        import re  # noqa: PLC0415
+        counts: dict[str, int] = {}
+        for s in self._batch_symbols:
+            m = re.search(r"\b[Cc]\d{4,}\b", s.supplier_part or "")
+            if m:
+                key = m.group(0).upper()
+                counts[key] = counts.get(key, 0) + 1
+        return counts
+
     def on_row_replace(self, info: SymbolInfo) -> None:
         """行内「搜索替换」:在线搜索立创元件并绑定到该元件(模式 C 单行版)。"""
-        dlg = ReplaceSearchDialog(self.client, info.reference, info.value, self)
+        dlg = ReplaceSearchDialog(self.client, info.reference, info.value,
+                                  usage_counts=self._usage_counts(), parent=self)
         if dlg.exec() != QDialog.DialogCode.Accepted or dlg.selected is None:
             return
         symbols = [s for s in self._batch_symbols

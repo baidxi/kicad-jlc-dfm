@@ -41,6 +41,57 @@ class Pipeline:
         # 已注册封装全集("lib:name" 字符串;由外部经 IPC 懒加载注入)。
         # 非空时启用"内置封装优先":通用件命中 KiCad 官方库则跳过立创下载。
         self.builtin_footprints: set[str] | None = None
+        # 全集磁盘缓存(IPC busy 时仍可命中内置,避免静默回退立创)
+        import sys  # noqa: PLC0415
+        if sys.platform == "win32":
+            self._builtin_cache = (Path.home() / "AppData" / "Local"
+                                   / "lceda-kicad-plugin" / "builtin_footprints.txt")
+        else:
+            self._builtin_cache = (Path.home() / ".cache" / "lceda-kicad-plugin"
+                                   / "builtin_footprints.txt")
+
+    def ensure_builtin_set(self, bridge=None, force_refresh: bool = False) -> bool:
+        """确保内置封装全集可用:内存 → 磁盘缓存 → IPC(成功后写盘)。
+
+        返回是否已有可用集合。IPC 拉取失败(KiCad busy)时仍会用过期
+        磁盘缓存兜底(>7 天才强制重拉),避免 busy 高发期静默回退立创。
+        """
+        import time  # noqa: PLC0415
+
+        if self.builtin_footprints and not force_refresh:
+            return True
+
+        # 1) 磁盘缓存永远先兜底(不论新旧;旧了稍后尽力 IPC 刷新)
+        try:
+            if self._builtin_cache.exists():
+                lines = self._builtin_cache.read_text(encoding="utf-8").splitlines()
+                cached = {ln for ln in lines if ln}
+                if cached:
+                    self.builtin_footprints = cached
+        except OSError:
+            pass
+
+        # 2) 尽力 IPC 刷新(缓存缺失/过期/强制时;失败保留缓存结果)
+        need_refresh = force_refresh or self.builtin_footprints is None
+        if not need_refresh:
+            try:
+                need_refresh = time.time() - self._builtin_cache.stat().st_mtime > 7 * 86400
+            except OSError:
+                pass
+        if need_refresh and bridge is not None and getattr(bridge, "connected", False):
+            try:
+                fps = set(bridge.list_all_footprints())
+                if fps:
+                    self.builtin_footprints = fps
+                    try:
+                        self._builtin_cache.parent.mkdir(parents=True, exist_ok=True)
+                        self._builtin_cache.write_text(
+                            "\n".join(sorted(fps)), encoding="utf-8")
+                    except OSError:
+                        pass
+            except Exception:  # noqa: BLE001 - busy/断连:留在缓存兜底
+                pass
+        return self.builtin_footprints is not None
 
     # ── 封装决策:内置优先 ──
 
