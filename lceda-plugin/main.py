@@ -419,7 +419,12 @@ class PlaceWorker(QThread):
 
                 self.log.emit("[4/4] 后台:3D 模型")
                 step = self.pipeline.ingest_step(comp)
-                self.log.emit(f"完成(3D: {step.name if step else '元件未绘制模型'})")
+                if step:
+                    self.log.emit(f"完成(3D: {step.name})")
+                else:
+                    self.log.emit("完成(3D: 该元件无独立 3D 模型文件——"
+                                  "商城网页的 3D 是用封装轮廓实时挤出的渲染效果,"
+                                  "KiCad 3D 查看器可开启封装挤出显示获得同等效果)")
             self.log.emit("从任务栏恢复本窗口可继续放置下一个元件")
             self.finished_ok.emit()
         except Exception as ex:  # noqa: BLE001

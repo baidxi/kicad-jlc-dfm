@@ -242,7 +242,6 @@ def convert_footprint(doc: str, name: str, description: str | None = None,
             layer_flag = _s(a[4])
             number = _s(a[5])
             x, y = _n(a[6]) * _MIL_TO_MM, _n(a[7]) * _MIL_TO_MM
-            rot = _n(a[14])
             hole, shape = a[9], a[10]
 
             tht = isinstance(hole, list) and len(hole) > 0
@@ -253,13 +252,11 @@ def convert_footprint(doc: str, name: str, description: str | None = None,
             k_shape, w, h = _pad_shape(shape)
             if w <= 0:
                 w = h = 1.6
-            # EasyEDA 对 90°/270° pad 的 shape 宽高已按最终朝向给出,
-            # 而 KiCad 的 (size w h) 是"未旋转尺寸"+ rot 旋转 —— 奇数倍
-            # 90° 时必须交换,否则 pad 宽于 pitch,上下两排相邻焊盘
-            # 重叠连成一条(用户可见的"pin 全成一排"现象)。
-            rot = _n(a[14])
-            if abs(rot % 180 - 90) < 0.001:
-                w, h = h, w
+            # pad 旋转角在 a[8](已用官方 SVG 逐 pad 交叉验证:VQFN-40
+            # 全部 270°、QFN-68 全部 0°,shape 为未旋转基础尺寸)。
+            # 注意不要误读 a[14](无关杂项字段,值恰为 0/90 曾致全部方向错)。
+            # KiCad 的 (size w h)+(at ... rot) 与 EasyEDA 语义一致,直接透传。
+            rot = _n(a[8])
 
             if tht:
                 k_type, layers = "thru_hole", '"*.Cu" "*.Mask"'
@@ -420,7 +417,10 @@ def _sym_unit_body(a: list[Any], pin_meta: dict[str, dict[str, str]],
         m = pin_meta.get(pid, {})
         x, y = _n(a[4]) * _SYM_UNIT_TO_MM, -_n(a[5]) * _SYM_UNIT_TO_MM
         length = _n(a[6]) * _SYM_UNIT_TO_MM
-        rot = _n(a[7])
+        # EE 的 pin rot 是"线延伸方向"(EE 坐标 y 向上);转换已把 y 翻转
+        # 到 KiCad(y 向上、at 为尖端),角度必须同步镜像:(360-rot)%360。
+        # 直传会使上下方向的引脚颠倒(pin41 现象:顶部 GND 脚指向体内)。
+        rot = (360.0 - _n(a[7])) % 360.0
         etype = _pin_elec_type(m.get("Pin Type"))
         pname = m.get("NAME", "")
         pnum = m.get("NUMBER", "")
