@@ -12,6 +12,10 @@
 用法:
     python3 packaging/build_pcm.py             # 打包 + kipy validate
     python3 packaging/build_pcm.py --no-validate
+
+pip.pyz 取 PIP_PYZ_PATH 或 dist/_cache/pip.pyz 缓存,皆无则在线下载一次
+并写缓存(5s 连通探测 + 60s 硬性总超时,失败仅告警不卡打包);
+此后打包直接用缓存,不再联网。
 """
 
 from __future__ import annotations
@@ -41,25 +45,109 @@ def _has_interactive(kipy_dir: Path) -> bool:
 
 
 PIP_PYZ_URL = "https://bootstrap.pypa.io/pip/pip.pyz"
+PIP_PYZ_MIN_BYTES = 1_000_000  # 完整 zipapp 约 2 MB,过小视为截断
+PIP_PYZ_CACHE = DIST / "_cache" / "pip.pyz"
+PIP_PYZ_TOTAL_TIMEOUT = 60.0   # 下载硬性总超时(秒)
+PIP_PYZ_PROBE_TIMEOUT = 5.0    # 连通性探测超时(秒)
+
+
+def _pip_pyz_valid(p: Path) -> bool:
+    try:
+        return p.is_file() and p.stat().st_size >= PIP_PYZ_MIN_BYTES
+    except OSError:
+        return False
+
+
+def _run_daemon(func, timeout: float):
+    """守护线程运行 func 并限时等待,返回其结果;超时抛 TimeoutError。
+
+    socket 超时只作用于单次读写:DNS 解析阻塞不走 socket 超时,
+    慢速传输中每次读到数据还会重置计时器 —— 唯一可靠的兜底是
+    主线程限时 join + 守护线程(超时后不阻塞进程退出)。
+    """
+    import threading
+
+    box: list = []
+
+    def _wrap() -> None:
+        try:
+            box.append(func())
+        except BaseException as exc:  # noqa: BLE001
+            box.append(exc)
+
+    t = threading.Thread(target=_wrap, daemon=True)
+    t.start()
+    t.join(timeout)
+    if t.is_alive():
+        raise TimeoutError(f"超过 {timeout:.0f}s 未完成")
+    if box and isinstance(box[0], BaseException):
+        raise box[0]
+    return box[0] if box else None
 
 
 def _fetch_pip_pyz(plugin_dir: Path) -> bool:
-    """下载官方 pip zipapp 随包分发(约 2 MB)。
+    """获取官方 pip zipapp 随包分发(约 2 MB)。
 
     全新 Ubuntu 24.04 等系统无 python3-pip 且 ensurepip 被剥离,
     KiCad 内置精简 Python 亦然;插件入口首次运行的依赖引导
     (pip.pyz install --user)以此兜底。
+
+    来源优先级:PIP_PYZ_PATH 环境变量 > dist/_cache 本地缓存 > 在线下载
+    (成功后写缓存,此后打包不再联网)。bootstrap.pypa.io 国内直连
+    慢/易卡死:先 5s 探测连通性,再以守护线程 + 60s 硬性总超时下载
+    (socket 超时管不住 DNS 阻塞与慢速重传);直写缓存路径、校验
+    大小后才拷入包目录,失败清理残留、仅告警不阻塞打包。
     """
     dest = plugin_dir / "pip.pyz"
-    try:
-        import urllib.request
 
-        urllib.request.urlretrieve(PIP_PYZ_URL, dest)
-        print(f"pip.pyz {dest.stat().st_size // 1024} KB(随包分发)")
+    def _use(src: Path, note: str) -> bool:
+        shutil.copy2(src, dest)
+        print(f"pip.pyz {dest.stat().st_size // 1024} KB({note})")
         return True
+
+    local = os.environ.get("PIP_PYZ_PATH")  # 离线环境:指向本地 zipapp
+    if local:
+        p = Path(local)
+        if _pip_pyz_valid(p):
+            return _use(p, f"PIP_PYZ_PATH={local}")
+        print(f"[warn] PIP_PYZ_PATH={local} 不存在或过小,忽略")
+
+    if _pip_pyz_valid(PIP_PYZ_CACHE):
+        return _use(PIP_PYZ_CACHE,
+                    f"本地缓存 {PIP_PYZ_CACHE.relative_to(APP_ROOT)}")
+
+    import urllib.parse
+    import urllib.request
+
+    host = urllib.parse.urlparse(PIP_PYZ_URL).hostname or "bootstrap.pypa.io"
+
+    def _probe() -> None:
+        import socket
+
+        addr = socket.getaddrinfo(host, 443, proto=socket.IPPROTO_TCP)
+        with socket.create_connection(addr[0][4], timeout=PIP_PYZ_PROBE_TIMEOUT):
+            pass
+
+    def _download() -> None:
+        import socket
+
+        socket.setdefaulttimeout(20)  # 单次读写超时(总超时由 _run_daemon 兜底)
+        PIP_PYZ_CACHE.parent.mkdir(parents=True, exist_ok=True)
+        urllib.request.urlretrieve(PIP_PYZ_URL, PIP_PYZ_CACHE)
+
+    try:
+        _run_daemon(_probe, PIP_PYZ_PROBE_TIMEOUT)
+        _run_daemon(_download, PIP_PYZ_TOTAL_TIMEOUT)
+        if not _pip_pyz_valid(PIP_PYZ_CACHE):
+            raise OSError(
+                f"下载不完整({PIP_PYZ_CACHE.stat().st_size} 字节)")
+        return _use(PIP_PYZ_CACHE,
+                    f"已下载并缓存到 {PIP_PYZ_CACHE.relative_to(APP_ROOT)}")
     except Exception as exc:  # noqa: BLE001
-        print(f"[warn] pip.pyz 下载失败({exc});"
-              "无 pip 的目标机将无法自动安装依赖")
+        PIP_PYZ_CACHE.unlink(missing_ok=True)
+        print(f"[warn] pip.pyz 下载失败({exc});本次包内将缺 pip.pyz,"
+              "无 pip 的目标机无法自动装依赖。可手动放置: "
+              f"{PIP_PYZ_CACHE.relative_to(APP_ROOT)} / 设 PIP_PYZ_PATH")
         return False
 
 

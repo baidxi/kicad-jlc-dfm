@@ -1,10 +1,15 @@
 """立创标准指令流 → KiCad 原生格式转换器。
 
-语义基准:
-- 单位:封装 mil ×0.0254 mm(Y 同向);符号 10mil ×0.254 mm(Y 取反)
-  —— 与 KiCad 官方解析器一致(pcb: MilsToIU / sch: 10mil 基准 + Y 镜像)
-- 层号映射、THT/SMD 推断、FILL 双形态 path 处理沿用 KicadConverter.cs 结构,
-  但该 C# 实现未经端到端测试,几何以官方导入器输出对拍为准(见 plans 阶段 0)
+语义基准(与 KiCad 官方 EasyEDA Pro 导入器逐条对齐,源码实证
+common/io/easyedapro + pcb_io/easyedapro + sch_io/easyedapro):
+- 封装:官方 ScalePos = (ScaleSize(x), -ScaleSize(y)),ScaleSize = mil×0.0254
+  → 全部几何 Y 取反;PAD 旋转 SetOrientationDegrees 直传;子形状旋转角直传,
+  且 KiCad RotatePoint 正角 = 数学负角(dx' = dx·cosθ + dy·sinθ,
+  dy' = -dx·sinθ + dy·cosθ);矩形官方公式 kcenter = ScalePos(start)+size/2。
+- 符号:ScalePosSym = (x, -y),10mil×0.254 基准,Y 取反;PIN 旋转约定与
+  KiCad 相同、数值直传(官方注释 "rotation value maps over unchanged")。
+- 3D:立创 STEP 与 EE PCB 同向(EE y 北),封装 Y 取反后模型需 y 镜像
+  → (scale (xyz 1 -1 1))。
 - 输出:封装 → .kicad_mod 文本;符号 → .kicad_sym 文本(含 Supplier 预置属性)
 """
 
@@ -141,14 +146,14 @@ def _append_segments(body: list[str], pts: Any, layer: str, width: float) -> Non
     xs, ys = _flat_points(pts)
     for i in range(len(xs) - 1):
         body.append(
-            f'  (fp_line (start {_fmt(xs[i] * _MIL_TO_MM)} {_fmt(ys[i] * _MIL_TO_MM)}) '
-            f'(end {_fmt(xs[i + 1] * _MIL_TO_MM)} {_fmt(ys[i + 1] * _MIL_TO_MM)}) '
+            f'  (fp_line (start {_fmt(xs[i] * _MIL_TO_MM)} {_fmt(-ys[i] * _MIL_TO_MM)}) '
+            f'(end {_fmt(xs[i + 1] * _MIL_TO_MM)} {_fmt(-ys[i + 1] * _MIL_TO_MM)}) '
             f'(stroke (width {_fmt(width)}) (type solid)) (layer "{layer}"))\n')
 
 
 def _append_circle(body: list[str], cx_mil: float, cy_mil: float, r_mil: float,
                    layer: str, width: float, filled: bool = False) -> None:
-    cx, cy, r = cx_mil * _MIL_TO_MM, cy_mil * _MIL_TO_MM, r_mil * _MIL_TO_MM
+    cx, cy, r = cx_mil * _MIL_TO_MM, -cy_mil * _MIL_TO_MM, r_mil * _MIL_TO_MM
     fill = " solid" if filled else ""
     body.append(
         f'  (fp_circle (center {_fmt(cx)} {_fmt(cy)}) (end {_fmt(cx + r)} {_fmt(cy)}) '
@@ -157,16 +162,27 @@ def _append_circle(body: list[str], cx_mil: float, cy_mil: float, r_mil: float,
 
 def _append_rect(body: list[str], x_mil: float, y_mil: float, w_mil: float,
                  h_mil: float, rot_deg: float, layer: str, width: float) -> None:
-    """EasyEDA 子形状 R(x,y 为左上角,w/h 宽高,rot 绕矩形中心)。"""
+    """EasyEDA 子形状 R(x,y=起点,w/h 尺寸,绕起点旋转 rot)。
+
+    照官方 ParseContour:中心 = ScalePos(start)+ScaleSize(size)/2,中心与
+    四角都按 KiCad RotatePoint 正角旋转(数学负角:x' = dx·cos+dy·sin,
+    y' = -dx·sin+dy·cos)。
+    """
     import math  # noqa: PLC0415
+    sx, sy = x_mil * _MIL_TO_MM, -y_mil * _MIL_TO_MM
     w, h = w_mil * _MIL_TO_MM, h_mil * _MIL_TO_MM
-    cx = (x_mil + w_mil / 2) * _MIL_TO_MM
-    cy = (y_mil - h_mil / 2) * _MIL_TO_MM      # y 翻转后的中心
+    cx, cy = sx + w / 2, sy + h / 2          # 未旋转中心(官方 kcenter 公式)
     rad = math.radians(rot_deg)
+    ct, st = math.cos(rad), math.sin(rad)
+
+    def _rot(px: float, py: float, ax: float, ay: float) -> tuple[float, float]:
+        dx, dy = px - ax, py - ay
+        return (ax + dx * ct + dy * st, ay - dx * st + dy * ct)
+
+    ccx, ccy = _rot(cx, cy, sx, sy)          # 中心绕 start 转
     corners = []
     for dx, dy in ((-w / 2, -h / 2), (w / 2, -h / 2), (w / 2, h / 2), (-w / 2, h / 2)):
-        corners.append((cx + dx * math.cos(rad) - dy * math.sin(rad),
-                        cy + dx * math.sin(rad) + dy * math.cos(rad)))
+        corners.append(_rot(ccx + dx, ccy + dy, ccx, ccy))
     pts = corners + [corners[0]]
     for i in range(4):
         body.append(
@@ -200,7 +216,7 @@ def _append_fill_poly(body: list[str], pts: Any, layer: str) -> None:
     xs, ys = _flat_points(pts)
     if len(xs) < 3:
         return
-    pts_txt = " ".join(f"(xy {_fmt(x * _MIL_TO_MM)} {_fmt(y * _MIL_TO_MM)})"
+    pts_txt = " ".join(f"(xy {_fmt(x * _MIL_TO_MM)} {_fmt(-y * _MIL_TO_MM)})"
                        for x, y in zip(xs, ys))
     body.append(
         f'  (fp_poly (pts {pts_txt}) (stroke (width 0.05) (type solid)) '
@@ -218,7 +234,7 @@ def _append_fills(body: list[str], path: Any, layer: str) -> None:
             continue
         head = _s(shape[0])
         if head == "CIRCLE" and len(shape) >= 3:
-            cx, cy = _n(shape[1]) * _MIL_TO_MM, _n(shape[2]) * _MIL_TO_MM
+            cx, cy = _n(shape[1]) * _MIL_TO_MM, -_n(shape[2]) * _MIL_TO_MM
             r = _n(shape[3]) * _MIL_TO_MM if len(shape) > 3 else 0.5
             body.append(
                 f'  (fp_circle (center {_fmt(cx)} {_fmt(cy)}) (end {_fmt(cx + r)} {_fmt(cy)}) '
@@ -241,7 +257,8 @@ def convert_footprint(doc: str, name: str, description: str | None = None,
         if op == "PAD" and len(a) > 14:
             layer_flag = _s(a[4])
             number = _s(a[5])
-            x, y = _n(a[6]) * _MIL_TO_MM, _n(a[7]) * _MIL_TO_MM
+            # 官方 ScalePos:(x, -y) —— EE PCB 坐标 y 向上,KiCad y 向下
+            x, y = _n(a[6]) * _MIL_TO_MM, -_n(a[7]) * _MIL_TO_MM
             hole, shape = a[9], a[10]
 
             tht = isinstance(hole, list) and len(hole) > 0
@@ -252,10 +269,8 @@ def convert_footprint(doc: str, name: str, description: str | None = None,
             k_shape, w, h = _pad_shape(shape)
             if w <= 0:
                 w = h = 1.6
-            # pad 旋转角在 a[8](已用官方 SVG 逐 pad 交叉验证:VQFN-40
-            # 全部 270°、QFN-68 全部 0°,shape 为未旋转基础尺寸)。
-            # 注意不要误读 a[14](无关杂项字段,值恰为 0/90 曾致全部方向错)。
-            # KiCad 的 (size w h)+(at ... rot) 与 EasyEDA 语义一致,直接透传。
+            # pad 旋转角在 a[8],官方 SetOrientationDegrees(orientation) 直传
+            # (VQFN-40 全 270°、QFN-68 全 0° 已交叉验证;勿误读 a[14] 杂项字段)。
             rot = _n(a[8])
 
             if tht:
@@ -277,7 +292,7 @@ def convert_footprint(doc: str, name: str, description: str | None = None,
         elif op == "VIA" and len(a) > 8:
             # EasyEDA VIA(常见于 EP 散热盘接地孔阵列):
             # a[5]=x a[6]=y a[7]=钻孔 a[8]=孔环外径(mil)→ 转无编号通孔 pad
-            x, y = _n(a[5]) * _MIL_TO_MM, _n(a[6]) * _MIL_TO_MM
+            x, y = _n(a[5]) * _MIL_TO_MM, -_n(a[6]) * _MIL_TO_MM
             drill = max(abs(_n(a[7])) * _MIL_TO_MM, 0.1)
             dia = max(abs(_n(a[8])) * _MIL_TO_MM, drill + 0.2)
             body.append(
@@ -317,18 +332,20 @@ def convert_footprint(doc: str, name: str, description: str | None = None,
         f"  (fp_text value {_esc(value_text or name)} (at 0 2.4 unlocked) "
         f'(layer "F.Fab") (effects (font (size 1 1) (thickness 0.15))))\n')
     if model_ref:
+        # 立创 STEP 与 EE PCB 同向;封装几何已 Y 取反,模型需 y 镜像对齐
         head.append(
             f'  (model {_esc(model_ref)}\n    (offset (xyz 0 0 0))\n'
-            f"    (scale (xyz 1 1 1))\n    (rotate (xyz 0 0 0))\n  )\n")
+            f"    (scale (xyz 1 -1 1))\n    (rotate (xyz 0 0 0))\n  )\n")
 
     return "".join(head) + "".join(body) + ")\n"
 
 
 def inject_model(fp_text: str, model_ref: str) -> str:
     """向 .kicad_mod 文本注入/替换 (model) 子句(STEP 后到场景)。"""
+    # y 镜像与 convert_footprint 的 (model) 子句保持一致(几何已 Y 取反)
     model_block = (
         f'  (model {_esc(model_ref)}\n    (offset (xyz 0 0 0))\n'
-        f"    (scale (xyz 1 1 1))\n    (rotate (xyz 0 0 0))\n  )\n")
+        f"    (scale (xyz 1 -1 1))\n    (rotate (xyz 0 0 0))\n  )\n")
     # 移除既有 model 子句(简单行扫描,遇到非 model 行保留)
     lines = fp_text.splitlines(keepends=True)
     kept: list[str] = []
@@ -417,10 +434,10 @@ def _sym_unit_body(a: list[Any], pin_meta: dict[str, dict[str, str]],
         m = pin_meta.get(pid, {})
         x, y = _n(a[4]) * _SYM_UNIT_TO_MM, -_n(a[5]) * _SYM_UNIT_TO_MM
         length = _n(a[6]) * _SYM_UNIT_TO_MM
-        # EE 的 pin rot 是"线延伸方向"(EE 坐标 y 向上);转换已把 y 翻转
-        # 到 KiCad(y 向上、at 为尖端),角度必须同步镜像:(360-rot)%360。
-        # 直传会使上下方向的引脚颠倒(pin41 现象:顶部 GND 脚指向体内)。
-        rot = (360.0 - _n(a[7])) % 360.0
+        # 官方:"EasyEDA Pro and KiCad symbol libraries share the same rotation
+        # convention ... the rotation value maps over unchanged" —— 直传
+        # (0=体右 90=体上 180=体左 270=体下),位置已 ScalePosSym 取反。
+        rot = _n(a[7]) % 360.0
         etype = _pin_elec_type(m.get("Pin Type"))
         pname = m.get("NAME", "")
         pnum = m.get("NUMBER", "")
